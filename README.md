@@ -19,7 +19,7 @@ Both implement the same `MetadataStore` interface.
 Run:
 
 ```bash
-python -m aegaeon.main proxy-server --host 0.0.0.0 --port 8080
+python -m aegaeon --host 0.0.0.0 --port 8080
 ```
 
 Routes:

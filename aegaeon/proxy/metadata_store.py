@@ -9,12 +9,7 @@ from typing import Any
 class InstanceRole(str, Enum):
     PREFILL = "PREFILL"
     DECODE = "DECODE"
-
-
-class InstancePhase(str, Enum):
-    IDLE = "IDLE"
-    PREFILLING = "PREFILLING"
-    DECODING = "DECODING"
+    COLOCATED = "COLOCATED"
 
 
 class RequestPhase(str, Enum):
@@ -47,13 +42,11 @@ class InstanceInfo:
 @dataclass(slots=True)
 class InstanceStatus:
     current_models: set[str]
-    phase: InstancePhase
     queue_depth: int
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "current_models": sorted(self.current_models),
-            "phase": self.phase.value,
             "queue_depth": int(self.queue_depth),
         }
 
@@ -62,7 +55,6 @@ class InstanceStatus:
         models = payload.get("current_models", [])
         return cls(
             current_models=set(str(m) for m in models),
-            phase=InstancePhase(payload["phase"]),
             queue_depth=int(payload["queue_depth"]),
         )
 

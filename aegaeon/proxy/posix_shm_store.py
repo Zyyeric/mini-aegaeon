@@ -12,7 +12,6 @@ from typing import Any
 
 from .metadata_store import (
     InstanceInfo,
-    InstancePhase,
     InstanceStatus,
     MetadataStore,
     RequestAssignment,
@@ -49,7 +48,7 @@ class PosixShmMetadataStore(MetadataStore):
             current["info"] = info.to_dict()
             current.setdefault(
                 "status",
-                InstanceStatus(current_models=set(), phase=InstancePhase.IDLE, queue_depth=0).to_dict(),
+                InstanceStatus(current_models=set(), queue_depth=0).to_dict(),
             )
             instances[info.instance_id] = current
             self._write_blob(blob)

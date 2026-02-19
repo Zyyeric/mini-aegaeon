@@ -7,7 +7,6 @@ from aegaeon.config import ProxyConfig
 
 from .metadata_store import (
     InstanceInfo,
-    InstancePhase,
     InstanceRole,
     InstanceStatus,
     MetadataStore,
@@ -19,22 +18,14 @@ from .router import RequestEnvelope, RouteDecision
 
 
 @dataclass(slots=True)
-class ProxyLayer:
+class Proxy:
     cfg: ProxyConfig
     store: MetadataStore
     _pending_by_instance: dict[str, list[str]]
     _pending_lock: Lock
 
     @classmethod
-    def create(cls, cfg: ProxyConfig) -> "ProxyLayer":
-        return cls._build(cfg, create=True)
-
-    @classmethod
-    def attach(cls, cfg: ProxyConfig) -> "ProxyLayer":
-        return cls._build(cfg, create=False)
-
-    @classmethod
-    def _build(cls, cfg: ProxyConfig, create: bool) -> "ProxyLayer":
+    def _build(cls, cfg: ProxyConfig, create: bool) -> "Proxy":
         store = SharedMetadataStore(
             name=cfg.shared_memory_name,
             size=cfg.shared_memory_size,
@@ -78,41 +69,38 @@ class ProxyLayer:
         model_id: str,
         phase: RequestPhase,
     ) -> RouteDecision:
-        prefill_candidates: list[tuple[str, InstanceStatus, InstanceInfo]] = []
+        best_model: tuple[str, InstanceStatus, InstanceInfo] | None = None
+        best_fallback: tuple[str, InstanceStatus, InstanceInfo] | None = None
+
         for instance_id, status in snapshot.instances.items():
             info = snapshot.infos.get(instance_id)
-            if info is None or info.role != InstanceRole.PREFILL:
+            if info is None:
                 continue
-            if model_id not in status.current_models:
+
+            if self.cfg.deployment_mode == "disaggregated" and info.role != InstanceRole.PREFILL:
                 continue
-            if phase == RequestPhase.PREFILL and status.phase not in {
-                InstancePhase.IDLE,
-                InstancePhase.PREFILLING,
-            }:
-                continue
-            prefill_candidates.append((instance_id, status, info))
+            if self.cfg.deployment_mode not in {"disaggregated", "colocation"}:
+                raise ValueError(f"unsupported deployment mode: {self.cfg.deployment_mode}")
 
-        if prefill_candidates:
-            instance_id, _, info = min(prefill_candidates, key=lambda x: (x[1].queue_depth, x[0]))
-            return RouteDecision(
-                request_id=request_id,
-                instance_id=instance_id,
-                endpoint=info.endpoint,
-                phase=phase,
-                queued=False,
-            )
+            current = (instance_id, status, info)
+            if best_fallback is None or (status.queue_depth, instance_id) < (
+                best_fallback[1].queue_depth,
+                best_fallback[0],
+            ):
+                best_fallback = current
 
-        fallback_candidates: list[tuple[str, InstanceStatus, InstanceInfo]] = []
-        for instance_id, status in snapshot.instances.items():
-            info = snapshot.infos.get(instance_id)
-            if info is None or info.role != InstanceRole.PREFILL:
-                continue
-            fallback_candidates.append((instance_id, status, info))
+            if model_id in status.current_models and (
+                best_model is None
+                or (status.queue_depth, instance_id) < (best_model[1].queue_depth, best_model[0])
+            ):
+                best_model = current
 
-        if not fallback_candidates:
-            raise KeyError("no prefill instance available")
+        selected = best_model if best_model is not None else best_fallback
+        if selected is None:
+            raise KeyError("no routable instance available")
 
-        instance_id, status, info = min(fallback_candidates, key=lambda x: (x[1].queue_depth, x[0]))
+        queued = best_model is None
+        instance_id, status, info = selected
         with self._pending_lock:
             q = self._pending_by_instance.setdefault(instance_id, [])
             q.append(request_id)
@@ -120,7 +108,6 @@ class ProxyLayer:
             instance_id,
             InstanceStatus(
                 current_models=status.current_models,
-                phase=status.phase,
                 queue_depth=status.queue_depth + 1,
             ),
         )
@@ -129,7 +116,7 @@ class ProxyLayer:
             instance_id=instance_id,
             endpoint=info.endpoint,
             phase=phase,
-            queued=True,
+            queued=queued,
         )
 
     def publish_instance_metadata(
@@ -138,13 +125,12 @@ class ProxyLayer:
         role: InstanceRole,
         endpoint: str,
         models: set[str],
-        phase: InstancePhase,
         queue_depth: int,
     ) -> None:
         self.store.register_instance(InstanceInfo(instance_id=instance_id, role=role, endpoint=endpoint))
         self.store.update_instance_status(
             instance_id,
-            InstanceStatus(current_models=models, phase=phase, queue_depth=queue_depth),
+            InstanceStatus(current_models=models, queue_depth=queue_depth),
         )
 
     def shutdown(self, unlink: bool = False) -> None:

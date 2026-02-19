@@ -6,7 +6,6 @@ from typing import Any
 
 from .metadata_store import (
     InstanceInfo,
-    InstancePhase,
     InstanceStatus,
     MetadataStore,
     RequestAssignment,
@@ -40,7 +39,7 @@ class RedisMetadataStore(MetadataStore):
         return f"req:{request_id}"
 
     def register_instance(self, info: InstanceInfo) -> None:
-        default_status = InstanceStatus(current_models=set(), phase=InstancePhase.IDLE, queue_depth=0)
+        default_status = InstanceStatus(current_models=set(), queue_depth=0)
         pipe = self.client.pipeline()
         pipe.sadd("inst_index", info.instance_id)
         pipe.set(self._info_key(info.instance_id), json.dumps(info.to_dict(), separators=(",", ":")))

@@ -2,7 +2,6 @@
 
 from .metadata_store import (
     InstanceInfo,
-    InstancePhase,
     InstanceRole,
     InstanceStatus,
     MetadataStore,
@@ -14,11 +13,10 @@ from .metadata_store import (
 from .posix_shm_store import PosixShmMetadataStore
 from .redis_store import RedisMetadataStore
 from .router import RequestEnvelope, RouteDecision
-from .service import ProxyLayer
+from .proxy import Proxy
 
 __all__ = [
     "InstanceInfo",
-    "InstancePhase",
     "InstanceRole",
     "InstanceStatus",
     "MetadataStore",
@@ -30,5 +28,5 @@ __all__ = [
     "RedisMetadataStore",
     "RequestEnvelope",
     "RouteDecision",
-    "ProxyLayer",
+    "Proxy",
 ]

@@ -1,13 +1,16 @@
 """Memory management primitives for Aegaeon."""
 
-from .kv_slab import SlabAllocationError, SlabKVBackend
 from .model_cache import ModelCache, ModelCacheEntry
-from .vram_manager import VRAMManager
+from .model_cache_manager import ModelCacheManager
+from .weight import HFWeightLoader, load_hf_weight
+from .weight_manager import TensorMap, WeightManager
 
 __all__ = [
-    "SlabAllocationError",
-    "SlabKVBackend",
     "ModelCache",
     "ModelCacheEntry",
-    "VRAMManager",
+    "ModelCacheManager",
+    "TensorMap",
+    "WeightManager",
+    "HFWeightLoader",
+    "load_hf_weight",
 ]

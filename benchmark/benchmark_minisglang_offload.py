@@ -1,0 +1,225 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+
+THIS_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = THIS_DIR.parent
+MINISGL_PYTHON = PROJECT_ROOT / "third-party" / "mini-sglang" / "python"
+if str(MINISGL_PYTHON) not in sys.path:
+    sys.path.insert(0, str(MINISGL_PYTHON))
+
+from minisgl.core import SamplingParams  # noqa: E402
+from minisgl.llm import LLM  # noqa: E402
+from transformers import AutoTokenizer  # noqa: E402
+
+
+@dataclass
+class RunMetrics:
+    model: str
+    run_idx: int
+    ttft_ms: float
+    tbt_mean_ms: float
+    tbt_p99_ms: float
+    tokens: int
+    e2e_s: float
+
+
+def _percentile(values: list[float], p: float) -> float | None:
+    if not values:
+        return None
+    s = sorted(values)
+    if len(s) == 1:
+        return s[0]
+    rank = (len(s) - 1) * p
+    lo = int(math.floor(rank))
+    hi = int(math.ceil(rank))
+    if lo == hi:
+        return s[lo]
+    w = rank - lo
+    return s[lo] * (1.0 - w) + s[hi] * w
+
+
+def _summary(samples: list[float]) -> dict[str, float | None]:
+    return {
+        "avg": (sum(samples) / len(samples)) if samples else None,
+        "p50": _percentile(samples, 0.50),
+        "p90": _percentile(samples, 0.90),
+        "p99": _percentile(samples, 0.99),
+    }
+
+
+def _make_prompt_ids(tokenizer: AutoTokenizer, prompt_len: int, seed: int) -> list[int]:
+    rng = random.Random(seed)
+    vocab = max(int(tokenizer.vocab_size), 1024)
+    return [rng.randint(1, vocab - 1) for _ in range(prompt_len)]
+
+
+def _run_one_model(
+    model: str,
+    prompt_len: int,
+    output_tokens: int,
+    runs: int,
+    memory_ratio: float,
+    seed: int,
+) -> tuple[list[RunMetrics], float]:
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    prompt_ids = _make_prompt_ids(tokenizer, prompt_len=prompt_len, seed=seed)
+
+    t_init_start = time.perf_counter()
+    llm = LLM(
+        model,
+        dtype=torch.float16,
+        offload_linear_weight_to_cpu=True,
+        memory_ratio=memory_ratio,
+        cuda_graph_max_bs=0,
+    )
+    init_s = time.perf_counter() - t_init_start
+
+    original_send = llm.send_result
+    token_timestamps: list[float] = []
+
+    def instrumented_send(reply):
+        now = time.perf_counter()
+        for _ in reply:
+            token_timestamps.append(now)
+        return original_send(reply)
+
+    llm.send_result = instrumented_send
+
+    all_runs: list[RunMetrics] = []
+    try:
+        for run_idx in range(runs):
+            token_timestamps.clear()
+            sp = SamplingParams(
+                temperature=0.0,
+                ignore_eos=True,
+                max_tokens=output_tokens,
+            )
+            t0 = time.perf_counter()
+            out = llm.generate([prompt_ids], sp)
+            t1 = time.perf_counter()
+
+            token_ids = out[0].get("token_ids", []) if out else []
+            if not token_timestamps:
+                continue
+            ttft_ms = (token_timestamps[0] - t0) * 1000.0
+            tbts_ms = [
+                (token_timestamps[i + 1] - token_timestamps[i]) * 1000.0
+                for i in range(len(token_timestamps) - 1)
+            ]
+            all_runs.append(
+                RunMetrics(
+                    model=model,
+                    run_idx=run_idx,
+                    ttft_ms=ttft_ms,
+                    tbt_mean_ms=float(np.mean(tbts_ms)) if tbts_ms else 0.0,
+                    tbt_p99_ms=float(np.percentile(tbts_ms, 99)) if tbts_ms else 0.0,
+                    tokens=len(token_ids),
+                    e2e_s=t1 - t0,
+                )
+            )
+    finally:
+        del llm
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return all_runs, init_s
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="mini-sglang offload benchmark (TTFT/TBT per model, comparable to mini-aegaeon report)"
+    )
+    parser.add_argument(
+        "--models",
+        required=True,
+        help="Comma-separated model ids or local paths (same set used for mini-aegaeon benchmark).",
+    )
+    parser.add_argument("--prompt-length", type=int, default=512)
+    parser.add_argument("--output-tokens", type=int, default=64)
+    parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument("--memory-ratio", type=float, default=0.85)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--out-json", default="benchmark/results/minisglang_offload.json")
+    args = parser.parse_args()
+
+    models = [m.strip() for m in args.models.split(",") if m.strip()]
+    if not models:
+        raise SystemExit("No models provided.")
+
+    per_model: dict[str, dict] = {}
+    per_run: list[dict] = []
+    total_init_s = 0.0
+    total_tokens = 0
+    total_e2e_s = 0.0
+
+    for i, model in enumerate(models):
+        runs, init_s = _run_one_model(
+            model=model,
+            prompt_len=args.prompt_length,
+            output_tokens=args.output_tokens,
+            runs=args.runs,
+            memory_ratio=args.memory_ratio,
+            seed=args.seed + i,
+        )
+        total_init_s += init_s
+
+        ttft_samples = [r.ttft_ms for r in runs]
+        tbt_samples = [r.tbt_mean_ms for r in runs]
+        tbt_p99_samples = [r.tbt_p99_ms for r in runs]
+        tokens = [r.tokens for r in runs]
+        e2e = [r.e2e_s for r in runs]
+        total_tokens += int(sum(tokens))
+        total_e2e_s += float(sum(e2e))
+
+        per_model[model] = {
+            "runs": len(runs),
+            "init_time_s": init_s,
+            "ttft_ms": _summary(ttft_samples),
+            "tbt_ms": _summary(tbt_samples),
+            "tbt_p99_ms": _summary(tbt_p99_samples),
+            "tokens_avg": (sum(tokens) / len(tokens)) if tokens else None,
+            "e2e_s_avg": (sum(e2e) / len(e2e)) if e2e else None,
+            "ttft_ms_samples": ttft_samples,
+            "tbt_ms_samples": tbt_samples,
+        }
+        per_run.extend([r.__dict__ for r in runs])
+
+    all_ttft = [x for m in per_model.values() for x in m["ttft_ms_samples"]]
+    all_tbt = [x for m in per_model.values() for x in m["tbt_ms_samples"]]
+
+    report = {
+        "service": "mini-sglang-offload",
+        "offload_linear_weight_to_cpu": True,
+        "models": models,
+        "prompt_length": args.prompt_length,
+        "output_tokens": args.output_tokens,
+        "runs": args.runs,
+        "memory_ratio": args.memory_ratio,
+        "total_init_time_s": total_init_s,
+        "total_tokens": total_tokens,
+        "total_e2e_s": total_e2e_s,
+        "ttft_ms": _summary(all_ttft),
+        "tbt_ms": _summary(all_tbt),
+        "per_model": per_model,
+        "per_run": per_run,
+    }
+
+    out = Path(args.out_json)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(json.dumps(report, indent=2))
+
+
+if __name__ == "__main__":
+    main()

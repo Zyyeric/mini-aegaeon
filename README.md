@@ -1,11 +1,6 @@
 # mini-aegaeon
 
-`mini-aegaeon` is a lightweight serving/runtime prototype focused on:
-
-- proxy-based routing using synchronized instance metadata
-- local/offline runtime loops for colocation/disaggregated experiments
-- scheduling hooks (`prefill`, `decode`, `colocated`)
-- offline benchmarking for TTFT/TBT and model-switch behavior
+`mini-aegaeon` is a lightweight implementation of Alibaba's Paper Aegaeon: Effective GPU Pooling for Concurrent LLM Serving on the Market
 
 ## Current Status
 

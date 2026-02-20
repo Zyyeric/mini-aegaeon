@@ -25,10 +25,25 @@ class DecodeScheduler:
         while self._active and len(batch) < self._max_batch_size:
             req = self._active.popleft()
             batch.append(req)
-            # In a real engine integration this would depend on EOS/finish state.
-            self._active.append(req)
+            # Offline mode support: stop re-enqueuing once per-request decode budget is exhausted.
+            if self._should_requeue(req):
+                self._active.append(req)
 
         return self._runner.run(Batch(requests=batch, phase="decode"))
 
     def stats(self) -> dict[str, Any]:
         return {"active_sequences": len(self._active), "max_batch_size": self._max_batch_size}
+
+    @staticmethod
+    def _should_requeue(req: Request) -> bool:
+        params = req.sampling_params
+        if not isinstance(params, dict):
+            return True
+
+        remaining = int(params.get("_offline_remaining_steps", 1))
+        if remaining <= 1:
+            params["_offline_remaining_steps"] = 0
+            return False
+
+        params["_offline_remaining_steps"] = remaining - 1
+        return True

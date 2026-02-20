@@ -17,6 +17,7 @@ def build_local_instances(
     prefill_count: int,
     decode_count: int,
     colocated_count: int,
+    model_cache_budget_bytes: int = 8 * 1024 * 1024 * 1024,
 ) -> dict[str, InstanceRuntime]:
     slots = detect_accelerator_slots()
     if deployment_mode == "disaggregated":
@@ -40,7 +41,7 @@ def build_local_instances(
         raise RuntimeError("no GPU/MIG resources detected")
 
     runtimes: dict[str, InstanceRuntime] = {}
-    shared_model_cache = ModelCache(8 * 1024 * 1024 * 1024)
+    shared_model_cache = ModelCache(model_cache_budget_bytes)
     shared_weight_loader = HFWeightLoader()
     if deployment_mode == "disaggregated":
         launch_plan: list[tuple[str, int]] = [
@@ -54,7 +55,7 @@ def build_local_instances(
         instance_id = f"{mode}-{idx}"
         rt = InstanceRuntime(
             RuntimeConfig(instance_id=instance_id, mode=mode),
-            MemoryConfig(model_cache_budget_bytes=8 * 1024 * 1024 * 1024),
+            MemoryConfig(model_cache_budget_bytes=model_cache_budget_bytes),
             model_cache=shared_model_cache,
             weight_loader=shared_weight_loader,
         )
@@ -85,6 +86,7 @@ def run_proxy_endpoint(
     decode_count: int,
     colocated_count: int,
     metadata_backend: str,
+    model_cache_budget_bytes: int = 8 * 1024 * 1024 * 1024,
 ) -> None:
     proxy = Proxy._build(
         ProxyConfig(metadata_backend=metadata_backend, deployment_mode=deployment_mode),
@@ -96,6 +98,7 @@ def run_proxy_endpoint(
         prefill_count,
         decode_count,
         colocated_count,
+        model_cache_budget_bytes=model_cache_budget_bytes,
     )
     print(f"proxy listening on http://{host}:{port} with local_instances={len(runtimes)}")
     run_proxy_server(proxy=proxy, host=host, port=port, local_instances=runtimes)
@@ -114,6 +117,7 @@ def launch_server() -> None:
     parser.add_argument("--prefill-count", type=int, default=1)
     parser.add_argument("--decode-count", type=int, default=0)
     parser.add_argument("--colocated-count", type=int, default=0)
+    parser.add_argument("--model-cache-budget-gb", type=float, default=8.0)
     parser.add_argument(
         "--deployment-mode",
         choices=["disaggregated", "colocation"],
@@ -131,6 +135,7 @@ def launch_server() -> None:
         decode_count=args.decode_count,
         colocated_count=args.colocated_count,
         metadata_backend=args.metadata_mode,
+        model_cache_budget_bytes=int(args.model_cache_budget_gb * 1024 * 1024 * 1024),
     )
 
 

@@ -27,3 +27,6 @@ env/
 
 # .vscode
 .vscode/
+
+# local benchmark model snapshots
+benchmark/local_models/

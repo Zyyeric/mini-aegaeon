@@ -29,18 +29,40 @@ class ColocatedScheduler:
         target_model = head.model
         batch: list[Request] = [head]
         deferred: deque[Request] = deque()
+        requeue: list[Request] = []
+
+        if self._should_requeue(head):
+            requeue.append(head)
 
         while self._queue and len(batch) < self._max_batch_size:
             req = self._queue.popleft()
             if req.model == target_model:
                 batch.append(req)
+                if self._should_requeue(req):
+                    requeue.append(req)
             else:
                 deferred.append(req)
 
         while deferred:
             self._queue.appendleft(deferred.pop())
+        for req in requeue:
+            self._queue.append(req)
 
         return self._runner.run(Batch(requests=batch, phase="colocate"))
 
     def stats(self) -> dict[str, Any]:
         return {"queue_depth": len(self._queue), "max_batch_size": self._max_batch_size}
+
+    @staticmethod
+    def _should_requeue(req: Request) -> bool:
+        params = req.sampling_params
+        if not isinstance(params, dict):
+            return False
+
+        remaining = int(params.get("_offline_remaining_steps", 1))
+        if remaining <= 1:
+            params["_offline_remaining_steps"] = 0
+            return False
+
+        params["_offline_remaining_steps"] = remaining - 1
+        return True

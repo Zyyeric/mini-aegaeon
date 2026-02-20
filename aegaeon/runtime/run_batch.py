@@ -11,15 +11,20 @@ class BatchRunner:
     def __init__(self, engine: Any | None = None) -> None:
         self._engine = engine
 
-    def run(self, batch: list[Request] | Batch, phase: str | None = None) -> BatchResult:
-        batch_obj = batch if isinstance(batch, Batch) else Batch(requests=batch, phase=str(phase or ""))
-        requests = batch_obj.requests
-        phase_name = batch_obj.phase
+    def run(self, batch: Batch) -> BatchResult:
+        requests = batch.requests
+        phase_name = batch.phase
 
         if not requests:
             return BatchResult(outputs={})
 
         if self._engine is None:
+            if phase_name in {"decode", "colocate"}:
+                outputs: dict[str, Any] = {}
+                for req in requests:
+                    tok = self._offline_next_token(req)
+                    outputs[req.request_id] = {"phase": phase_name, "tokens": [tok]}
+                return BatchResult(outputs=outputs)
             return BatchResult(
                 outputs={
                     req.request_id: {"phase": phase_name, "tokens": [int(t) for t in req.input_ids]}
@@ -57,6 +62,16 @@ class BatchRunner:
             return out
 
         return {req.request_id: {"phase": phase, "result": raw} for req in batch}
+
+    @staticmethod
+    def _offline_next_token(req: Request) -> int:
+        if not req.input_ids:
+            return 0
+        params = req.sampling_params if isinstance(req.sampling_params, dict) else {}
+        total = int(params.get("_offline_total_steps", 0))
+        remaining = int(params.get("_offline_remaining_steps", 1))
+        step_idx = 0 if total <= 0 else max(total - remaining - 1, 0)
+        return int(req.input_ids[step_idx % len(req.input_ids)])
 
 
 __all__ = ["BatchRunner", "BatchResult"]

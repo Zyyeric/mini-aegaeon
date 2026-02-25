@@ -38,7 +38,10 @@ class BatchRunner:
             if len(requests) == 1
             else [req.sampling_params for req in requests]
         )
+        sampling_params = self._normalize_sampling_params(sampling_params)
         model = requests[0].model
+        if hasattr(self._engine, "select_model"):
+            self._engine.select_model(model)
         weight_manager = getattr(self._engine, "weight_manager", None)
         if weight_manager is not None and hasattr(weight_manager, "select_model"):
             weight_manager.select_model(model)
@@ -49,12 +52,57 @@ class BatchRunner:
         return BatchResult(outputs=self._normalize_outputs(requests, phase_name, raw))
 
     @staticmethod
+    def _normalize_sampling_params(sampling_params: Any) -> Any:
+        # mini-sgl backend expects minisgl.core.SamplingParams, while offline flow uses plain dicts.
+        try:
+            from aegaeon.backend import SamplingParams as MiniSGLSamplingParams
+        except Exception:
+            return sampling_params
+
+        def convert_one(p: Any) -> Any:
+            if isinstance(p, MiniSGLSamplingParams):
+                return p
+            if not isinstance(p, dict):
+                return p
+            max_tokens = p.get("max_tokens")
+            if not isinstance(max_tokens, int) or max_tokens <= 0:
+                max_tokens = p.get("max_new_tokens")
+            if not isinstance(max_tokens, int) or max_tokens <= 0:
+                max_tokens = 1
+            temperature = p.get("temperature", 0.0)
+            if not isinstance(temperature, (int, float)):
+                temperature = 0.0
+            top_k = p.get("top_k", -1)
+            if not isinstance(top_k, int):
+                top_k = -1
+            top_p = p.get("top_p", 1.0)
+            if not isinstance(top_p, (int, float)):
+                top_p = 1.0
+            ignore_eos = p.get("ignore_eos", True)
+            if not isinstance(ignore_eos, bool):
+                ignore_eos = True
+            return MiniSGLSamplingParams(
+                temperature=float(temperature),
+                top_k=top_k,
+                top_p=float(top_p),
+                ignore_eos=ignore_eos,
+                max_tokens=max_tokens,
+            )
+
+        if isinstance(sampling_params, list):
+            return [convert_one(x) for x in sampling_params]
+        return convert_one(sampling_params)
+
+    @staticmethod
     def _normalize_outputs(batch: list[Request], phase: str, raw: Any) -> dict[str, Any]:
         if isinstance(raw, list) and len(raw) == len(batch):
             out: dict[str, Any] = {}
             for req, result in zip(batch, raw, strict=False):
                 if isinstance(result, str):
                     out[req.request_id] = {"phase": phase, "text": result}
+                elif isinstance(result, dict):
+                    # Preserve backend fields (e.g., token_ids) for accurate offline TTFT/TBT accounting.
+                    out[req.request_id] = {"phase": phase, **result}
                 elif hasattr(result, "text"):
                     out[req.request_id] = {"phase": phase, "text": str(result.text)}
                 else:

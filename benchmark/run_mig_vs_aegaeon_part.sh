@@ -4,7 +4,7 @@ set -euo pipefail
 # Run one part at a time:
 #   mig_on   : enable MIG and create partitions
 #   mig_off  : destroy MIG partitions and disable MIG
-#   sglang   : run mini-sglang offload benchmark on MIG UUIDs
+#   asymcompute (or sglang): run AsymCompute benchmark on MIG UUIDs
 #   aegaeon  : run mini-aegaeon benchmark on full GPU
 #   plot     : plot TTFT/TBT comparison from existing JSON outputs
 
@@ -30,15 +30,19 @@ NUM_REQUESTS=64
 PROMPT_LENGTH=512
 OUTPUT_TOKENS=64
 RUNS=5
+ARRIVAL_RATE_RPS=2.0
 MEMORY_RATIO=0.85
 MODEL_CACHE_BUDGET_GB=84
+BACKEND_MEMORY_RATIO=0.5
+BACKEND_MAX_LIVE_WORKERS=1
+BACKEND_MODEL_SWITCHING=0
 SEED=0
 RESULTS_DIR="benchmark/results/mig_vs_aegaeon_13b"
 
 usage() {
   cat <<EOF
 Usage:
-  bash benchmark/run_mig_vs_aegaeon_part.sh --part <mig_on|mig_off|sglang|aegaeon|plot> [options]
+  bash benchmark/run_mig_vs_aegaeon_part.sh --part <mig_on|mig_off|asymcompute|sglang|aegaeon|plot> [options]
 
 Core options:
   --part <name>                     Which part to run
@@ -52,8 +56,8 @@ MIG control:
   --gpu-index <int>                 GPU index for MIG commands (default: 0)
   --mig-profile-id <int>            MIG profile id (default: 19 -> 1g.12gb on many GPUs)
   --mig-count <int>                 Number of MIG partitions to create (default: 3)
-  --mig-uuids "<csv>"               MIG UUIDs for sglang part
-  --master-port-base <int>          Base MASTER_PORT for concurrent sglang jobs (default: 29600)
+  --mig-uuids "<csv>"               MIG UUIDs for asymcompute/sglang part
+  --master-port-base <int>          Base MASTER_PORT for concurrent asymcompute jobs (default: 29600)
 
 Benchmark knobs:
   --aegaeon-cuda-devices "<ids>"    CUDA_VISIBLE_DEVICES for aegaeon run (default: 0)
@@ -61,14 +65,18 @@ Benchmark knobs:
   --num-requests <int>              Aegaeon requests (default: 64)
   --prompt-length <int>             Prompt length/chars (default: 512)
   --output-tokens <int>             Generated tokens (default: 64)
-  --runs <int>                      mini-sglang runs per model (default: 5)
-  --memory-ratio <float>            mini-sglang memory ratio (default: 0.85)
+  --runs <int>                      AsymCompute runs per model (default: 5)
+  --arrival-rate-rps <float>        Request arrival rate used in shared trace replay (default: 2.0)
+  --memory-ratio <float>            AsymCompute memory ratio (default: 0.85)
   --model-cache-budget-gb <float>   Aegaeon model cache budget (default: 84)
+  --backend-memory-ratio <float>    Aegaeon mini-sgl backend memory ratio (default: 0.5)
+  --backend-max-live-workers <int>  Max concurrently live Aegaeon backend model workers (default: 1)
+  --backend-model-switching         Enable mini-sgl model-switching memory policy
   --seed <int>                      Random seed (default: 0)
 
 Examples:
   bash benchmark/run_mig_vs_aegaeon_part.sh --part mig_on
-  bash benchmark/run_mig_vs_aegaeon_part.sh --part sglang --mig-uuids "MIG-aaa,MIG-bbb,MIG-ccc" --predownload
+  bash benchmark/run_mig_vs_aegaeon_part.sh --part asymcompute --mig-uuids "MIG-aaa,MIG-bbb,MIG-ccc" --predownload
   bash benchmark/run_mig_vs_aegaeon_part.sh --part mig_off
   bash benchmark/run_mig_vs_aegaeon_part.sh --part aegaeon
   bash benchmark/run_mig_vs_aegaeon_part.sh --part plot
@@ -93,8 +101,12 @@ while [[ $# -gt 0 ]]; do
     --prompt-length) PROMPT_LENGTH="$2"; shift 2 ;;
     --output-tokens) OUTPUT_TOKENS="$2"; shift 2 ;;
     --runs) RUNS="$2"; shift 2 ;;
+    --arrival-rate-rps) ARRIVAL_RATE_RPS="$2"; shift 2 ;;
     --memory-ratio) MEMORY_RATIO="$2"; shift 2 ;;
     --model-cache-budget-gb) MODEL_CACHE_BUDGET_GB="$2"; shift 2 ;;
+    --backend-memory-ratio) BACKEND_MEMORY_RATIO="$2"; shift 2 ;;
+    --backend-max-live-workers) BACKEND_MAX_LIVE_WORKERS="$2"; shift 2 ;;
+    --backend-model-switching) BACKEND_MODEL_SWITCHING=1; shift 1 ;;
     --seed) SEED="$2"; shift 2 ;;
     --results-dir) RESULTS_DIR="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -130,6 +142,20 @@ build_model_refs() {
   done
 }
 
+generate_trace_for_model() {
+  local model_ref="$1"
+  local trace_json="$2"
+  local trace_seed="$3"
+  python benchmark/generate_request_trace.py \
+    --model "${model_ref}" \
+    --num-requests "${RUNS}" \
+    --prompt-tokens "${PROMPT_LENGTH}" \
+    --max-new-tokens "${OUTPUT_TOKENS}" \
+    --arrival-rate-rps "${ARRIVAL_RATE_RPS}" \
+    --seed "${trace_seed}" \
+    --out-json "${trace_json}" >/dev/null
+}
+
 predownload_if_requested() {
   local models_csv="$1"
   if [[ "${PREDOWNLOAD}" -eq 1 && "${MODEL_SOURCE}" == "local" ]]; then
@@ -163,14 +189,14 @@ run_mig_off() {
   nvidia-smi -L
 }
 
-run_sglang() {
+run_asymcompute() {
   local models_arr model_refs migs
   split_csv_to_array "${MODELS}" models_arr
   predownload_if_requested "${MODELS}"
   build_model_refs models_arr model_refs
 
   if [[ -z "${MIG_UUIDS}" ]]; then
-    echo "--mig-uuids is required for --part sglang"
+    echo "--mig-uuids is required for --part asymcompute (or sglang)"
     exit 1
   fi
   split_csv_to_array "${MIG_UUIDS}" migs
@@ -179,8 +205,13 @@ run_sglang() {
     exit 1
   fi
 
-  local per_model_dir="${RESULTS_DIR}/minisglang_per_model"
+  local per_model_dir="${RESULTS_DIR}/asymcompute_per_model"
+  local trace_dir="${RESULTS_DIR}/request_traces"
   mkdir -p "${per_model_dir}"
+  mkdir -p "${trace_dir}"
+  local mixed_trace_json="${trace_dir}/mixed_global_trace.json"
+  local joined_models
+  joined_models="$(IFS=,; echo "${model_refs[*]}")"
 
   if [[ "${MODEL_SOURCE}" == "local" ]]; then
     for m in "${model_refs[@]}"; do
@@ -196,7 +227,35 @@ run_sglang() {
   local n_mig="${#migs[@]}"
   local wave_count=$(( (total + n_mig - 1) / n_mig ))
 
-  echo "[SGLANG] Running ${total} model(s) across ${n_mig} MIG partition(s) in ${wave_count} wave(s)"
+  python benchmark/generate_request_trace.py \
+    --models "${joined_models}" \
+    --model-mix-policy round_robin \
+    --num-requests "${NUM_REQUESTS}" \
+    --prompt-tokens "${PROMPT_LENGTH}" \
+    --max-new-tokens "${OUTPUT_TOKENS}" \
+    --arrival-rate-rps "${ARRIVAL_RATE_RPS}" \
+    --seed "${SEED}" \
+    --out-json "${mixed_trace_json}" >/dev/null
+
+  python - "${mixed_trace_json}" "${trace_dir}" "${joined_models}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+mixed = json.loads(Path(sys.argv[1]).read_text())
+trace_dir = Path(sys.argv[2])
+models = [m for m in sys.argv[3].split(",") if m]
+by_model = {m: [] for m in models}
+for item in mixed:
+    model = item.get("model")
+    if model in by_model:
+        by_model[model].append(item)
+for model, items in by_model.items():
+    safe = model.replace("/", "__")
+    (trace_dir / f"{safe}.json").write_text(json.dumps(items, indent=2), encoding="utf-8")
+PY
+
+  echo "[ASYMCOMPUTE] Running ${total} model(s) across ${n_mig} MIG partition(s) in ${wave_count} wave(s)"
 
   for ((wave=0; wave<wave_count; wave++)); do
     pids=()
@@ -208,18 +267,21 @@ run_sglang() {
       model="${model_refs[$idx]}"
       safe="${model//\//__}"
       out_json="${per_model_dir}/${safe}.json"
+      trace_json="${trace_dir}/${safe}.json"
       mig="${migs[$i]}"
       port=$(( MASTER_PORT_BASE + i ))
+      trace_seed=$(( SEED + idx ))
 
       echo "  wave=${wave} slot=${i} model=${model} mig=${mig} port=${port}"
       CUDA_VISIBLE_DEVICES="${mig}" MASTER_PORT="${port}" \
       python benchmark/benchmark_minisglang_offload.py \
         --models "${model}" \
+        --trace-json "${trace_json}" \
         --prompt-length "${PROMPT_LENGTH}" \
         --output-tokens "${OUTPUT_TOKENS}" \
         --runs "${RUNS}" \
         --memory-ratio "${MEMORY_RATIO}" \
-        --seed "$(( SEED + idx ))" \
+        --seed "${trace_seed}" \
         --out-json "${out_json}" &
       pids+=("$!")
     done
@@ -228,7 +290,7 @@ run_sglang() {
     done
   done
 
-  local merged_json="${RESULTS_DIR}/minisglang_offload_merged.json"
+  local merged_json="${RESULTS_DIR}/asymcompute_merged.json"
   python - "${per_model_dir}" "${merged_json}" "${PROMPT_LENGTH}" "${OUTPUT_TOKENS}" "${RUNS}" <<'PY'
 import json
 import math
@@ -274,7 +336,7 @@ for p in sorted(per_model_dir.glob("*.json")):
     total_e2e += float(d.get("total_e2e_s", 0.0))
 
 merged = {
-    "service": "mini-sglang-offload-mig-partitioned",
+    "service": "asymcompute-mig-partitioned",
     "offload_linear_weight_to_cpu": True,
     "models": sorted(per_model.keys()),
     "prompt_length": prompt_length,
@@ -309,20 +371,36 @@ run_aegaeon() {
     done
   fi
 
+  local out_json="${RESULTS_DIR}/mini_aegaeon.json"
+  local trace_dir="${RESULTS_DIR}/request_traces"
+  mkdir -p "${trace_dir}"
+  local mixed_trace_json="${trace_dir}/mixed_aegaeon_trace.json"
   local joined_models
   joined_models="$(IFS=,; echo "${model_refs[*]}")"
-  local out_json="${RESULTS_DIR}/mini_aegaeon.json"
 
-  echo "[AEGAEON] Running single-instance switching workload on CUDA_VISIBLE_DEVICES=${AEGAEON_CUDA_DEVICES}"
-  CUDA_VISIBLE_DEVICES="${AEGAEON_CUDA_DEVICES}" \
-  python benchmark/offline_qwen3_colocation.py \
+  python benchmark/generate_request_trace.py \
     --models "${joined_models}" \
     --model-mix-policy round_robin \
     --num-requests "${NUM_REQUESTS}" \
-    --prompt-chars "${PROMPT_LENGTH}" \
+    --prompt-tokens "${PROMPT_LENGTH}" \
+    --max-new-tokens "${OUTPUT_TOKENS}" \
+    --arrival-rate-rps "${ARRIVAL_RATE_RPS}" \
+    --seed "${SEED}" \
+    --out-json "${mixed_trace_json}" >/dev/null
+
+  echo "[AEGAEON] Running mixed-model replay with max live backend workers=${BACKEND_MAX_LIVE_WORKERS} on CUDA_VISIBLE_DEVICES=${AEGAEON_CUDA_DEVICES}"
+  CUDA_VISIBLE_DEVICES="${AEGAEON_CUDA_DEVICES}" \
+  python benchmark/offline_qwen3_colocation.py \
+    --models "${joined_models}" \
+    --trace-json "${mixed_trace_json}" \
+    --backend mini_sgl \
+    --backend-memory-ratio "${BACKEND_MEMORY_RATIO}" \
+    --backend-max-live-workers "${BACKEND_MAX_LIVE_WORKERS}" \
+    $([[ "${BACKEND_MODEL_SWITCHING}" -eq 1 ]] && echo "--backend-model-switching") \
     --max-new-tokens "${OUTPUT_TOKENS}" \
     --colocated-count "${COLOCATED_COUNT}" \
     --model-cache-budget-gb "${MODEL_CACHE_BUDGET_GB}" \
+    --seed "${SEED}" \
     --out-json "${out_json}"
 
   echo "Saved: ${out_json}"
@@ -330,26 +408,32 @@ run_aegaeon() {
 
 run_plot() {
   local aeg_json="${RESULTS_DIR}/mini_aegaeon.json"
-  local sgl_json="${RESULTS_DIR}/minisglang_offload_merged.json"
+  local asym_json="${RESULTS_DIR}/asymcompute_merged.json"
   local out_dir="${RESULTS_DIR}/plots"
   if [[ ! -f "${aeg_json}" ]]; then
     echo "Missing ${aeg_json}"
     exit 1
   fi
-  if [[ ! -f "${sgl_json}" ]]; then
-    echo "Missing ${sgl_json}"
-    exit 1
+  # Backward compatibility with older output filename.
+  if [[ ! -f "${asym_json}" ]]; then
+    local old_json="${RESULTS_DIR}/minisglang_offload_merged.json"
+    if [[ -f "${old_json}" ]]; then
+      asym_json="${old_json}"
+    else
+      echo "Missing ${asym_json}"
+      exit 1
+    fi
   fi
   python benchmark/plot_ttft_tbt_compare.py \
     --aegaeon-json "${aeg_json}" \
-    --minisglang-json "${sgl_json}" \
+    --asymcompute-json "${asym_json}" \
     --out-dir "${out_dir}"
 }
 
 case "${PART}" in
   mig_on) run_mig_on ;;
   mig_off) run_mig_off ;;
-  sglang) run_sglang ;;
+  sglang|asymcompute) run_asymcompute ;;
   aegaeon) run_aegaeon ;;
   plot) run_plot ;;
   *) echo "Unsupported --part: ${PART}"; usage; exit 1 ;;

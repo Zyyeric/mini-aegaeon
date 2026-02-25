@@ -113,3 +113,10 @@ class InstanceRuntime:
             self.cfg.instance_id,
             InstanceStatus(current_models=set(models), queue_depth=queue_depth),
         )
+
+    def close(self) -> None:
+        if self.backend is not None and hasattr(self.backend, "shutdown"):
+            try:
+                self.backend.shutdown()
+            except Exception:
+                LOGGER.exception("Failed to shutdown backend for instance %s", self.cfg.instance_id)

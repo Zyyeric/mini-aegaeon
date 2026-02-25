@@ -40,6 +40,11 @@ class OfflineAegaeon:
         metadata_backend: str = "shared_memory",
         proxy_cfg: ProxyConfig | None = None,
         model_cache_budget_bytes: int = 8 * 1024 * 1024 * 1024,
+        backend: str = "none",
+        backend_model: str | None = None,
+        backend_memory_ratio: float = 0.5,
+        backend_max_live_workers: int = 1,
+        backend_model_switching: bool = False,
     ) -> None:
         self.proxy = Proxy._build(
             proxy_cfg
@@ -56,6 +61,11 @@ class OfflineAegaeon:
             decode_count=decode_count,
             colocated_count=colocated_count,
             model_cache_budget_bytes=model_cache_budget_bytes,
+            backend=backend,
+            backend_model=backend_model,
+            backend_memory_ratio=backend_memory_ratio,
+            backend_max_live_workers=backend_max_live_workers,
+            backend_model_switching=backend_model_switching,
         )
         self.counter = 0
         self._pending: dict[str, _OfflineRequestState] = {}
@@ -87,10 +97,16 @@ class OfflineAegaeon:
         runtime.ensure_model_ready(model)
 
         prompt = payload.get("prompt")
+        prompt_token_ids = payload.get("prompt_token_ids")
         if prompt is None and isinstance(payload.get("messages"), list):
             prompt = " ".join(str(m.get("content", "")) for m in payload["messages"] if isinstance(m, dict))
-        prompt_text = str(prompt or "")
-        input_ids = [ord(c) % 256 for c in prompt_text][:128] or [0]
+        if isinstance(prompt_token_ids, list) and prompt_token_ids:
+            input_ids = [int(x) for x in prompt_token_ids if isinstance(x, int)]
+            if not input_ids:
+                input_ids = [0]
+        else:
+            prompt_text = str(prompt or "")
+            input_ids = [ord(c) % 256 for c in prompt_text] or [0]
         uid = self.counter
         self.counter += 1
         sampling_params = payload.get("sampling_params", {})
@@ -200,7 +216,7 @@ class OfflineAegaeon:
                 per_token = max(delta // token_count, 1)
                 state.tbt_samples_ns.extend([per_token] * token_count)
         state.last_emit_ns = ts_ns
-        state.emitted_tokens += max(token_count, 1)
+        state.emitted_tokens += max(token_count, 0)
 
     def _finalize_request(self, state: _OfflineRequestState) -> None:
         completed_ns = state.last_emit_ns or time.perf_counter_ns()
@@ -248,16 +264,13 @@ class OfflineAegaeon:
     @staticmethod
     def _count_tokens(output: dict | object) -> int:
         if isinstance(output, dict):
+            token_ids = output.get("token_ids")
+            if isinstance(token_ids, list):
+                return len(token_ids)
             tokens = output.get("tokens")
             if isinstance(tokens, list):
                 return len(tokens)
-            text = output.get("text")
-            if isinstance(text, str):
-                return max(len(text), 1)
-            result = output.get("result")
-            if isinstance(result, str):
-                return max(len(result), 1)
-        return 1
+        return 0
 
     def clear_completed(self) -> None:
         self._completed.clear()
@@ -294,6 +307,9 @@ class OfflineAegaeon:
             self._publish_status(instance_id, runtime)
 
     def close(self, unlink: bool = True) -> None:
+        for rt in self.instances.values():
+            if hasattr(rt, "close"):
+                rt.close()
         self.proxy.shutdown(unlink=unlink)
 
 

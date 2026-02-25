@@ -18,28 +18,20 @@ Still minimal / prototype:
 
 ## Environment
 
-Project requires Python 3.10+ (tested with venv usage).
-
-Common dependencies for benchmarking:
+Project requires Python 3.10+ 
 
 ```bash
-uv add torch numpy huggingface_hub safetensors
-```
-
-If using private/gated HF repos, login first:
-
-```bash
-huggingface-cli login
+uv sync
 ```
 
 ## Metadata Backends
 
 - `shared_memory` (default): `PosixShmMetadataStore`
-- `redis`: `RedisMetadataStore`
+- `redis`: `RedisMetadataStore` (Not tested)
 
 Both implement the same `MetadataStore` interface.
 
-## Run Online Proxy Endpoint
+## Run Online Proxy Endpoint (In Progress)
 
 From `mini-aegaeon/`:
 

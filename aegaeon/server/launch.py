@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 
 from aegaeon.config import MemoryConfig, ProxyConfig, RuntimeConfig
-from aegaeon.memory import HFWeightLoader, ModelCache
+from aegaeon.memory import HFWeightLoader, ModelCache, ModelCacheManager
 from aegaeon.proxy import InstanceRole
 from aegaeon.proxy.proxy import Proxy
 from aegaeon.runtime import InstanceRuntime
@@ -18,6 +18,11 @@ def build_local_instances(
     decode_count: int,
     colocated_count: int,
     model_cache_budget_bytes: int = 8 * 1024 * 1024 * 1024,
+    backend: str = "none",
+    backend_model: str | None = None,
+    backend_memory_ratio: float = 0.5,
+    backend_max_live_workers: int = 1,
+    backend_model_switching: bool = False,
 ) -> dict[str, InstanceRuntime]:
     slots = detect_accelerator_slots()
     if deployment_mode == "disaggregated":
@@ -43,6 +48,21 @@ def build_local_instances(
     runtimes: dict[str, InstanceRuntime] = {}
     shared_model_cache = ModelCache(model_cache_budget_bytes)
     shared_weight_loader = HFWeightLoader()
+    backend_engine = None
+    if backend == "mini_sgl":
+        from aegaeon.backend import MiniSGLMultiBackend
+        import torch
+
+        # Keep cached weights in the same dtype used by mini-sgl workers.
+        shared_weight_loader = HFWeightLoader(dtype=torch.float16)
+        shared_weight_manager = ModelCacheManager(cache=shared_model_cache, device="cpu")
+        backend_engine = MiniSGLMultiBackend(
+            weight_manager=shared_weight_manager,
+            memory_ratio=backend_memory_ratio,
+            max_live_workers=backend_max_live_workers,
+            model_switching=backend_model_switching,
+        )
+
     if deployment_mode == "disaggregated":
         launch_plan: list[tuple[str, int]] = [
             *(("prefill", i) for i in range(prefill_count)),
@@ -56,6 +76,7 @@ def build_local_instances(
         rt = InstanceRuntime(
             RuntimeConfig(instance_id=instance_id, mode=mode),
             MemoryConfig(model_cache_budget_bytes=model_cache_budget_bytes),
+            backend_engine=backend_engine,
             model_cache=shared_model_cache,
             weight_loader=shared_weight_loader,
         )

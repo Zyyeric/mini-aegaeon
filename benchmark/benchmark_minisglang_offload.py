@@ -34,6 +34,43 @@ class RunMetrics:
     e2e_s: float
 
 
+def _load_trace(trace_json: str, default_model: str, default_max_tokens: int) -> list[dict]:
+    data = json.loads(Path(trace_json).read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("trace json must be a list of request entries")
+    out: list[dict] = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            continue
+        prompt_ids = item.get("prompt_token_ids")
+        if not isinstance(prompt_ids, list) or not prompt_ids:
+            continue
+        cleaned_ids: list[int] = []
+        for x in prompt_ids:
+            if isinstance(x, int):
+                cleaned_ids.append(x)
+        if not cleaned_ids:
+            continue
+        offset_ms = item.get("arrival_offset_ms", 0.0)
+        try:
+            offset_ms_f = float(offset_ms)
+        except (TypeError, ValueError):
+            offset_ms_f = 0.0
+        max_new_tokens = item.get("max_new_tokens", default_max_tokens)
+        if not isinstance(max_new_tokens, int) or max_new_tokens <= 0:
+            max_new_tokens = default_max_tokens
+        out.append(
+            {
+                "request_id": str(item.get("request_id", f"trace-{i}")),
+                "model": str(item.get("model", default_model)),
+                "prompt_token_ids": cleaned_ids,
+                "max_new_tokens": max_new_tokens,
+                "arrival_offset_ms": max(offset_ms_f, 0.0),
+            }
+        )
+    return out
+
+
 def _percentile(values: list[float], p: float) -> float | None:
     if not values:
         return None
@@ -71,6 +108,7 @@ def _run_one_model(
     runs: int,
     memory_ratio: float,
     seed: int,
+    trace_reqs: list[dict] | None = None,
 ) -> tuple[list[RunMetrics], float]:
     tokenizer = AutoTokenizer.from_pretrained(model)
     prompt_ids = _make_prompt_ids(tokenizer, prompt_len=prompt_len, seed=seed)
@@ -98,15 +136,33 @@ def _run_one_model(
 
     all_runs: list[RunMetrics] = []
     try:
-        for run_idx in range(runs):
+        if trace_reqs:
+            requests = trace_reqs
+        else:
+            requests = [
+                {
+                    "prompt_token_ids": prompt_ids,
+                    "max_new_tokens": output_tokens,
+                    "arrival_offset_ms": float(i),
+                }
+                for i in range(runs)
+            ]
+
+        replay_t0 = time.perf_counter()
+        for run_idx, req in enumerate(requests):
             token_timestamps.clear()
+            target_t = replay_t0 + (float(req.get("arrival_offset_ms", 0.0)) / 1000.0)
+            now_t = time.perf_counter()
+            if target_t > now_t:
+                time.sleep(target_t - now_t)
             sp = SamplingParams(
                 temperature=0.0,
                 ignore_eos=True,
-                max_tokens=output_tokens,
+                max_tokens=int(req.get("max_new_tokens", output_tokens)),
             )
+            prompt_for_run = req.get("prompt_token_ids", prompt_ids)
             t0 = time.perf_counter()
-            out = llm.generate([prompt_ids], sp)
+            out = llm.generate([prompt_for_run], sp)
             t1 = time.perf_counter()
 
             token_ids = out[0].get("token_ids", []) if out else []
@@ -150,6 +206,7 @@ def main() -> None:
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--memory-ratio", type=float, default=0.85)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--trace-json", default="")
     parser.add_argument("--out-json", default="benchmark/results/minisglang_offload.json")
     args = parser.parse_args()
 
@@ -164,6 +221,13 @@ def main() -> None:
     total_e2e_s = 0.0
 
     for i, model in enumerate(models):
+        trace_reqs: list[dict] | None = None
+        if args.trace_json:
+            loaded = _load_trace(args.trace_json, default_model=model, default_max_tokens=args.output_tokens)
+            # This benchmark process serves one model; keep only matching trace entries.
+            trace_reqs = [x for x in loaded if x["model"] == model]
+            if not trace_reqs:
+                raise SystemExit(f"No trace entries for model={model} in {args.trace_json}")
         runs, init_s = _run_one_model(
             model=model,
             prompt_len=args.prompt_length,
@@ -171,6 +235,7 @@ def main() -> None:
             runs=args.runs,
             memory_ratio=args.memory_ratio,
             seed=args.seed + i,
+            trace_reqs=trace_reqs,
         )
         total_init_s += init_s
 

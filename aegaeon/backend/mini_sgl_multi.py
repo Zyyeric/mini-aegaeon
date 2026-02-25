@@ -1,21 +1,11 @@
 from __future__ import annotations
 
 import multiprocessing as mp
-import os
 import traceback
 from dataclasses import asdict, is_dataclass
-from pathlib import Path
 from typing import Any
 
-from aegaeon.memory.weight_manager import WeightManager
-
-
-def _ensure_minisgl_importable() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    minisgl_python_dir = repo_root / "third-party" / "mini-sglang" / "python"
-    path_str = str(minisgl_python_dir)
-    if path_str not in os.sys.path:
-        os.sys.path.insert(0, path_str)
+from aegaeon.memory.weight_manager import TensorMap, WeightManager
 
 
 def _sampling_to_payload(sampling_params: Any) -> Any:
@@ -55,12 +45,13 @@ def _worker_main(
     model: str,
     memory_ratio: float,
     model_switching: bool,
+    use_dummy_weight: bool,
     req_q: mp.Queue,
     resp_q: mp.Queue,
     worker_idx: int,
 ) -> None:
+    import os
     os.environ["MASTER_PORT"] = str(32000 + worker_idx)
-    _ensure_minisgl_importable()
     import torch
     from minisgl.core import SamplingParams
     from minisgl.llm import LLM
@@ -71,37 +62,9 @@ def _worker_main(
         offload_linear_weight_to_cpu=False,
         memory_ratio=memory_ratio,
         model_switching=model_switching,
+        use_dummy_weight=use_dummy_weight,
         cuda_graph_max_bs=0,
     )
-    gpu_loaded = True
-
-    def _park_to_cpu() -> None:
-        nonlocal gpu_loaded
-        if not gpu_loaded:
-            return
-        state = llm.engine.model.state_dict()
-        cpu_state = {
-            k: v.detach().to("cpu", non_blocking=False).pin_memory()
-            for k, v in state.items()
-        }
-        llm.engine.model.load_state_dict(cpu_state)
-        torch.cuda.synchronize(llm.engine.device)
-        torch.cuda.empty_cache()
-        gpu_loaded = False
-
-    def _unpark_to_gpu() -> None:
-        nonlocal gpu_loaded
-        if gpu_loaded:
-            return
-        state = llm.engine.model.state_dict()
-        dev = llm.engine.device
-        gpu_state = {
-            k: v.detach().to(device=dev, non_blocking=True)
-            for k, v in state.items()
-        }
-        llm.engine.model.load_state_dict(gpu_state)
-        torch.cuda.synchronize(dev)
-        gpu_loaded = True
 
     try:
         while True:
@@ -109,16 +72,10 @@ def _worker_main(
             if item is None:
                 break
             cmd = item.get("cmd", "generate")
-            if cmd == "park":
+            if cmd == "load_weights_for_batch":
                 try:
-                    _park_to_cpu()
-                    resp_q.put({"ok": True})
-                except Exception:
-                    resp_q.put({"ok": False, "err": traceback.format_exc()})
-                continue
-            if cmd == "unpark":
-                try:
-                    _unpark_to_gpu()
+                    state_dict = item["state_dict"]
+                    llm.engine.model.load_state_dict(state_dict)
                     resp_q.put({"ok": True})
                 except Exception:
                     resp_q.put({"ok": False, "err": traceback.format_exc()})
@@ -126,8 +83,6 @@ def _worker_main(
 
             prompts = item["prompts"]
             payload = item["sampling_params"]
-            if not gpu_loaded:
-                _unpark_to_gpu()
 
             if isinstance(payload, list):
                 sampling_params = [SamplingParams(**x) for x in payload]
@@ -159,10 +114,12 @@ class MiniSGLMultiBackend:
         memory_ratio: float = 0.5,
         max_live_workers: int = 1,
         model_switching: bool = False,
+        use_dummy_weight: bool = False,
     ) -> None:
         self._memory_ratio = memory_ratio
         self._max_live_workers = max(1, int(max_live_workers))
         self._model_switching = bool(model_switching)
+        self._use_dummy_weight = bool(use_dummy_weight)
         self._active_model: str | None = None
         self._ctx = mp.get_context("spawn")
         self._workers: dict[str, tuple[mp.Process, mp.Queue, mp.Queue]] = {}
@@ -188,21 +145,31 @@ class MiniSGLMultiBackend:
             p.join(timeout=2)
 
     @staticmethod
-    def _send_control(req_q: mp.Queue, resp_q: mp.Queue, cmd: str) -> None:
-        req_q.put({"cmd": cmd})
+    def _send_load_weights(req_q: mp.Queue, resp_q: mp.Queue, state_dict: TensorMap) -> None:
+        req_q.put({"cmd": "load_weights_for_batch", "state_dict": state_dict})
         msg = resp_q.get()
         if not msg.get("ok", False):
-            raise RuntimeError(msg.get("err", f"worker command failed: {cmd}"))
+            raise RuntimeError(msg.get("err", "worker command failed: load_weights_for_batch"))
+
+    def prepare_for_batch(self) -> TensorMap:
+        return self.weight_manager.prepare_for_batch()
+
+    def after_batch(self) -> None:
+        self.weight_manager.after_batch()
+
+    def load_weights_for_batch(self, state_dict: TensorMap) -> None:
+        if self._active_model is None:
+            raise RuntimeError("Active model is not selected. Call select_model(model) first.")
+        if self._active_model not in self._workers:
+            self.select_model(self._active_model)
+        p, req_q, resp_q = self._workers[self._active_model]
+        if not p.is_alive():
+            raise RuntimeError(f"mini-sgl worker died for model: {self._active_model}")
+        self._send_load_weights(req_q, resp_q, state_dict)
 
     def select_model(self, model: str) -> None:
         self._step_counter += 1
-        prev_model = self._active_model
         self._active_model = model
-        if prev_model is not None and prev_model != model and prev_model in self._workers:
-            p_prev, req_prev, resp_prev = self._workers[prev_model]
-            if not p_prev.is_alive():
-                raise RuntimeError(f"mini-sgl worker died for model: {prev_model}")
-            self._send_control(req_prev, resp_prev, "park")
         if model not in self._workers:
             req_q: mp.Queue = self._ctx.Queue()
             resp_q: mp.Queue = self._ctx.Queue()
@@ -210,7 +177,15 @@ class MiniSGLMultiBackend:
             self._worker_counter += 1
             p = self._ctx.Process(
                 target=_worker_main,
-                args=(model, self._memory_ratio, self._model_switching, req_q, resp_q, idx),
+                args=(
+                    model,
+                    self._memory_ratio,
+                    self._model_switching,
+                    self._use_dummy_weight,
+                    req_q,
+                    resp_q,
+                    idx,
+                ),
                 daemon=True,
             )
             p.start()
@@ -218,7 +193,6 @@ class MiniSGLMultiBackend:
         p, req_q, resp_q = self._workers[model]
         if not p.is_alive():
             raise RuntimeError(f"mini-sgl worker died for model: {model}")
-        self._send_control(req_q, resp_q, "unpark")
         self._last_used_step[model] = self._step_counter
 
     def generate(self, prompts: list[list[int]], sampling_params: Any) -> Any:
@@ -229,16 +203,21 @@ class MiniSGLMultiBackend:
         p, req_q, resp_q = self._workers[self._active_model]
         if not p.is_alive():
             raise RuntimeError(f"mini-sgl worker died for model: {self._active_model}")
-        req_q.put(
-            {
-                "prompts": prompts,
-                "sampling_params": _sampling_to_payload(sampling_params),
-            }
-        )
-        msg = resp_q.get()
-        if not msg.get("ok", False):
-            raise RuntimeError(msg.get("err", "Unknown worker error"))
-        return msg["out"]
+        state_dict = self.prepare_for_batch()
+        self.load_weights_for_batch(state_dict)
+        try:
+            req_q.put(
+                {
+                    "prompts": prompts,
+                    "sampling_params": _sampling_to_payload(sampling_params),
+                }
+            )
+            msg = resp_q.get()
+            if not msg.get("ok", False):
+                raise RuntimeError(msg.get("err", "Unknown worker error"))
+            return msg["out"]
+        finally:
+            self.after_batch()
 
     def shutdown(self) -> None:
         for model in list(self._workers.keys()):

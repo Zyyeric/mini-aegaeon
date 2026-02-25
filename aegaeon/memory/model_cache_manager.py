@@ -22,7 +22,7 @@ class ModelCacheManager(WeightManager):
         self._dtype = dtype
         self._non_blocking = non_blocking
         self._active_model: str | None = None
-        self._gpu_state_dict: dict[str, Any] | None = None
+        self._batch_state_dict: dict[str, Any] | None = None
 
     def select_model(self, model: str) -> None:
         self._active_model = model
@@ -41,21 +41,22 @@ class ModelCacheManager(WeightManager):
             raise KeyError(f"model not found in cache: {self._active_model}")
 
         device = torch.device(self._device)
-        gpu_state: dict[str, Any] = {}
+
+        moved_state: dict[str, Any] = {}
         for name, tensor in cpu_state_dict.items():
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(f"state_dict[{name}] must be torch.Tensor")
             moved = tensor.to(device=device, non_blocking=self._non_blocking)
             if self._dtype is not None:
                 moved = moved.to(dtype=self._dtype)
-            gpu_state[name] = moved
+            moved_state[name] = moved
 
-        self._gpu_state_dict = gpu_state
-        return gpu_state
+        self._batch_state_dict = moved_state
+        return moved_state
 
     def after_batch(self) -> None:
-        if self._gpu_state_dict is None:
+        if self._batch_state_dict is None:
             return
 
-        # CPU pinned cache is the source of truth. After batch, release GPU copies only.
-        self._gpu_state_dict = None
+        # ModelCache remains the source of truth. Release per-batch materialization.
+        self._batch_state_dict = None

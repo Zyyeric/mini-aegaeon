@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import Lock, RLock
 from typing import Any, Mapping
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -17,13 +20,26 @@ class ModelCacheEntry:
 
 
 class ModelCache:
-    """Pinned-CPU model state cache.
+    """CPU model state cache with optional shared-memory storage.
 
-    Each model is stored as a flat state_dict mapping name -> CPU pinned tensor.
+    Each model is stored as a flat state_dict mapping name -> CPU tensor.
+    By default tensors are moved into torch's process-shared CPU storage
+    (`share_memory_`) so spawned worker processes can access the same storage.
+    Pinned-memory conversion is best-effort and may depend on the runtime.
     """
 
-    def __init__(self, budget_bytes: int) -> None:
+    def __init__(
+        self,
+        budget_bytes: int,
+        *,
+        use_shared_memory: bool = True,
+        pin_memory: bool = True,
+        strict_shared_memory: bool = True,
+    ) -> None:
         self._budget = budget_bytes
+        self._use_shared_memory = bool(use_shared_memory)
+        self._pin_memory = bool(pin_memory)
+        self._strict_shared_memory = bool(strict_shared_memory)
         self._used = 0
         self._entries: dict[str, ModelCacheEntry] = {}
         self._lock = RLock()
@@ -36,8 +52,8 @@ class ModelCache:
         raw_chunk_sizes: list[int] | None = None,
     ) -> ModelCacheEntry:
         with self._lock:
-            pinned_state = self._pin_state_dict(state_dict)
-            nbytes = self._state_dict_nbytes(pinned_state)
+            cached_state = self._prepare_state_dict(state_dict)
+            nbytes = self._state_dict_nbytes(cached_state)
 
             old = self._entries.get(model)
             old_bytes = old.nbytes if old is not None else 0
@@ -48,7 +64,7 @@ class ModelCache:
             entry = ModelCacheEntry(
                 model=model,
                 nbytes=nbytes,
-                state_dict=pinned_state,
+                state_dict=cached_state,
                 ref_count=0 if old is None else old.ref_count,
                 raw_chunk_sizes=list(raw_chunk_sizes or []),
             )
@@ -127,12 +143,22 @@ class ModelCache:
         with self._lock:
             tensors = sum(len(entry.state_dict) for entry in self._entries.values())
             refs = sum(entry.ref_count for entry in self._entries.values())
+            shared_tensors = 0
+            pinned_tensors = 0
+            for entry in self._entries.values():
+                for tensor in entry.state_dict.values():
+                    if hasattr(tensor, "is_shared") and callable(tensor.is_shared) and tensor.is_shared():
+                        shared_tensors += 1
+                    if hasattr(tensor, "is_pinned") and callable(tensor.is_pinned) and tensor.is_pinned():
+                        pinned_tensors += 1
             return {
                 "budget_bytes": self._budget,
                 "used_bytes": self._used,
                 "entries": len(self._entries),
                 "tensors": tensors,
                 "ref_count": refs,
+                "shared_tensors": shared_tensors,
+                "pinned_tensors": pinned_tensors,
             }
 
     @contextmanager
@@ -144,12 +170,11 @@ class ModelCache:
         finally:
             lock.release()
 
-    @staticmethod
-    def _pin_state_dict(state_dict: Mapping[str, Any]) -> dict[str, Any]:
+    def _prepare_state_dict(self, state_dict: Mapping[str, Any]) -> dict[str, Any]:
         try:
             import torch
         except Exception as exc:  # pragma: no cover - runtime env dependent
-            raise RuntimeError("torch is required to store pinned model state_dict") from exc
+            raise RuntimeError("torch is required to store model state_dict in cache") from exc
 
         out: dict[str, Any] = {}
         for name, tensor in state_dict.items():
@@ -159,8 +184,24 @@ class ModelCache:
                 raise TypeError(f"state_dict[{name}] must be torch.Tensor")
 
             cpu_tensor = tensor.detach().to("cpu")
-            if not cpu_tensor.is_pinned():
-                cpu_tensor = cpu_tensor.pin_memory()
+            if self._pin_memory and not cpu_tensor.is_pinned():
+                try:
+                    cpu_tensor = cpu_tensor.pin_memory()
+                except Exception:
+                    LOGGER.warning("pin_memory() failed for tensor '%s'; continuing without pinning", name)
+
+            if self._use_shared_memory:
+                try:
+                    cpu_tensor = cpu_tensor.share_memory_()
+                except Exception as exc:
+                    if self._strict_shared_memory:
+                        raise RuntimeError(
+                            f"share_memory_() failed for tensor '{name}' with strict_shared_memory=True"
+                        ) from exc
+                    LOGGER.warning(
+                        "share_memory_() failed for tensor '%s'; tensor stays process-local",
+                        name,
+                    )
             out[name] = cpu_tensor
         return out
 

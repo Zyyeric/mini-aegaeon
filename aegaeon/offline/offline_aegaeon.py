@@ -45,6 +45,7 @@ class OfflineAegaeon:
         backend_memory_ratio: float = 0.5,
         backend_max_live_workers: int = 1,
         backend_model_switching: bool = False,
+        backend_use_dummy_weight: bool = False,
     ) -> None:
         self.proxy = Proxy._build(
             proxy_cfg
@@ -66,6 +67,7 @@ class OfflineAegaeon:
             backend_memory_ratio=backend_memory_ratio,
             backend_max_live_workers=backend_max_live_workers,
             backend_model_switching=backend_model_switching,
+            backend_use_dummy_weight=backend_use_dummy_weight,
         )
         self.counter = 0
         self._pending: dict[str, _OfflineRequestState] = {}

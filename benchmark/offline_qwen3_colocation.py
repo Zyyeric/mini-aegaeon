@@ -146,6 +146,11 @@ def main() -> None:
         action="store_true",
         help="Enable model-switching memory policy in mini-sgl backend.",
     )
+    parser.add_argument(
+        "--backend-dummy-weight",
+        action="store_true",
+        help="Use mini-sgl dummy weights instead of loading HF safetensors.",
+    )
     parser.add_argument("--out-json", default="", help="Optional output JSON path")
     args = parser.parse_args()
 
@@ -185,6 +190,7 @@ def main() -> None:
         backend_memory_ratio=args.backend_memory_ratio,
         backend_max_live_workers=args.backend_max_live_workers,
         backend_model_switching=args.backend_model_switching,
+        backend_use_dummy_weight=args.backend_dummy_weight,
     )
     try:
         warmup_s = 0.0

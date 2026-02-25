@@ -23,6 +23,7 @@ def build_local_instances(
     backend_memory_ratio: float = 0.5,
     backend_max_live_workers: int = 1,
     backend_model_switching: bool = False,
+    backend_use_dummy_weight: bool = False,
 ) -> dict[str, InstanceRuntime]:
     slots = detect_accelerator_slots()
     if deployment_mode == "disaggregated":
@@ -48,20 +49,14 @@ def build_local_instances(
     runtimes: dict[str, InstanceRuntime] = {}
     shared_model_cache = ModelCache(model_cache_budget_bytes)
     shared_weight_loader = HFWeightLoader()
-    backend_engine = None
+    mini_sgl_backend_cls = None
     if backend == "mini_sgl":
         from aegaeon.backend import MiniSGLMultiBackend
         import torch
 
+        mini_sgl_backend_cls = MiniSGLMultiBackend
         # Keep cached weights in the same dtype used by mini-sgl workers.
         shared_weight_loader = HFWeightLoader(dtype=torch.float16)
-        shared_weight_manager = ModelCacheManager(cache=shared_model_cache, device="cpu")
-        backend_engine = MiniSGLMultiBackend(
-            weight_manager=shared_weight_manager,
-            memory_ratio=backend_memory_ratio,
-            max_live_workers=backend_max_live_workers,
-            model_switching=backend_model_switching,
-        )
 
     if deployment_mode == "disaggregated":
         launch_plan: list[tuple[str, int]] = [
@@ -73,6 +68,19 @@ def build_local_instances(
 
     for mode, idx in launch_plan:
         instance_id = f"{mode}-{idx}"
+        backend_engine = None
+        if backend == "mini_sgl":
+            if mini_sgl_backend_cls is None:
+                raise RuntimeError("mini_sgl backend class is not initialized")
+            # One backend per runtime instance, all sharing one model cache.
+            instance_weight_manager = ModelCacheManager(cache=shared_model_cache, device="cuda")
+            backend_engine = mini_sgl_backend_cls(
+                weight_manager=instance_weight_manager,
+                memory_ratio=backend_memory_ratio,
+                max_live_workers=backend_max_live_workers,
+                model_switching=backend_model_switching,
+                use_dummy_weight=backend_use_dummy_weight,
+            )
         rt = InstanceRuntime(
             RuntimeConfig(instance_id=instance_id, mode=mode),
             MemoryConfig(model_cache_budget_bytes=model_cache_budget_bytes),

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import queue as pyqueue
+import time
 import traceback
 from dataclasses import asdict, is_dataclass
 from typing import Any
@@ -45,12 +47,14 @@ def _worker_main(
     model: str,
     memory_ratio: float,
     model_switching: bool,
+    model_switching_budget_model_path: str | None,
     use_dummy_weight: bool,
     req_q: mp.Queue,
     resp_q: mp.Queue,
     worker_idx: int,
 ) -> None:
     import os
+
     os.environ["MASTER_PORT"] = str(32000 + worker_idx)
     import torch
     from minisgl.core import SamplingParams
@@ -62,6 +66,7 @@ def _worker_main(
         offload_linear_weight_to_cpu=False,
         memory_ratio=memory_ratio,
         model_switching=model_switching,
+        model_switching_budget_model_path=model_switching_budget_model_path,
         use_dummy_weight=use_dummy_weight,
         cuda_graph_max_bs=0,
     )
@@ -112,13 +117,15 @@ class MiniSGLMultiBackend:
         *,
         weight_manager: WeightManager,
         memory_ratio: float = 0.5,
-        max_live_workers: int = 1,
+        max_live_workers: int | None = None,
         model_switching: bool = False,
+        model_switching_budget_model_path: str | None = None,
         use_dummy_weight: bool = False,
     ) -> None:
         self._memory_ratio = memory_ratio
-        self._max_live_workers = max(1, int(max_live_workers))
+        _ = max_live_workers
         self._model_switching = bool(model_switching)
+        self._model_switching_budget_model_path = model_switching_budget_model_path
         self._use_dummy_weight = bool(use_dummy_weight)
         self._active_model: str | None = None
         self._ctx = mp.get_context("spawn")
@@ -126,7 +133,6 @@ class MiniSGLMultiBackend:
         self._worker_counter = 0
         self._last_used_step: dict[str, int] = {}
         self._step_counter = 0
-        # Keep Aegaeon's weight-manager contract with ModelCache-backed manager.
         self.weight_manager = weight_manager
 
     def _stop_worker(self, model: str) -> None:
@@ -145,9 +151,40 @@ class MiniSGLMultiBackend:
             p.join(timeout=2)
 
     @staticmethod
-    def _send_load_weights(req_q: mp.Queue, resp_q: mp.Queue, state_dict: TensorMap) -> None:
+    def _wait_worker_msg(
+        p: mp.Process,
+        resp_q: mp.Queue,
+        *,
+        cmd_name: str,
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        deadline = time.time() + timeout_s
+        while True:
+            if not p.is_alive():
+                raise RuntimeError(
+                    f"mini-sgl worker died while waiting for '{cmd_name}' response "
+                    f"(exitcode={p.exitcode})"
+                )
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out waiting for worker response to '{cmd_name}'")
+            try:
+                msg = resp_q.get(timeout=min(1.0, remaining))
+                if not isinstance(msg, dict):
+                    raise RuntimeError(f"invalid worker response for '{cmd_name}': {type(msg)}")
+                return msg
+            except pyqueue.Empty:
+                continue
+
+    @staticmethod
+    def _send_load_weights(
+        p: mp.Process,
+        req_q: mp.Queue,
+        resp_q: mp.Queue,
+        state_dict: TensorMap,
+    ) -> None:
         req_q.put({"cmd": "load_weights_for_batch", "state_dict": state_dict})
-        msg = resp_q.get()
+        msg = MiniSGLMultiBackend._wait_worker_msg(p, resp_q, cmd_name="load_weights_for_batch")
         if not msg.get("ok", False):
             raise RuntimeError(msg.get("err", "worker command failed: load_weights_for_batch"))
 
@@ -165,7 +202,7 @@ class MiniSGLMultiBackend:
         p, req_q, resp_q = self._workers[self._active_model]
         if not p.is_alive():
             raise RuntimeError(f"mini-sgl worker died for model: {self._active_model}")
-        self._send_load_weights(req_q, resp_q, state_dict)
+        self._send_load_weights(p, req_q, resp_q, state_dict)
 
     def select_model(self, model: str) -> None:
         self._step_counter += 1
@@ -181,6 +218,7 @@ class MiniSGLMultiBackend:
                     model,
                     self._memory_ratio,
                     self._model_switching,
+                    self._model_switching_budget_model_path,
                     self._use_dummy_weight,
                     req_q,
                     resp_q,
@@ -212,7 +250,7 @@ class MiniSGLMultiBackend:
                     "sampling_params": _sampling_to_payload(sampling_params),
                 }
             )
-            msg = resp_q.get()
+            msg = self._wait_worker_msg(p, resp_q, cmd_name="generate")
             if not msg.get("ok", False):
                 raise RuntimeError(msg.get("err", "Unknown worker error"))
             return msg["out"]

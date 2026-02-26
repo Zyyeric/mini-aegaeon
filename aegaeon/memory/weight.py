@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import logging
 import os
 from dataclasses import dataclass
 from typing import Dict
@@ -8,6 +9,8 @@ from typing import Dict
 import torch
 
 from .model_cache import ModelCache, ModelCacheEntry
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _merge_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -81,7 +84,13 @@ def load_hf_weight(
         for name, tensor in state_dict.items():
             t = tensor.to("cpu")
             if not t.is_pinned():
-                t = t.pin_memory()
+                try:
+                    t = t.pin_memory()
+                except Exception:
+                    LOGGER.warning(
+                        "pin_memory() failed for '%s'; continuing with non-pinned CPU tensor",
+                        name,
+                    )
             pinned[name] = t
         state_dict = pinned
     else:        

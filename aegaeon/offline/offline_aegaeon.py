@@ -43,7 +43,7 @@ class OfflineAegaeon:
         backend: str = "none",
         backend_model: str | None = None,
         backend_memory_ratio: float = 0.5,
-        backend_max_live_workers: int = 1,
+        backend_max_live_workers: int | None = None,
         backend_model_switching: bool = False,
         backend_use_dummy_weight: bool = False,
     ) -> None:

@@ -21,7 +21,7 @@ def build_local_instances(
     backend: str = "none",
     backend_model: str | None = None,
     backend_memory_ratio: float = 0.5,
-    backend_max_live_workers: int = 1,
+    backend_max_live_workers: int | None = None,
     backend_model_switching: bool = False,
     backend_use_dummy_weight: bool = False,
 ) -> dict[str, InstanceRuntime]:
@@ -79,6 +79,9 @@ def build_local_instances(
                 memory_ratio=backend_memory_ratio,
                 max_live_workers=backend_max_live_workers,
                 model_switching=backend_model_switching,
+                model_switching_budget_model_path=(
+                    backend_model if backend_model_switching else None
+                ),
                 use_dummy_weight=backend_use_dummy_weight,
             )
         rt = InstanceRuntime(

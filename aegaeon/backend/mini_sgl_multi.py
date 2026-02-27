@@ -8,6 +8,7 @@ from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from aegaeon.memory.weight_manager import TensorMap, WeightManager
+from aegaeon.utils import nvtx_range
 
 
 def _sampling_to_payload(sampling_params: Any) -> Any:
@@ -164,43 +165,46 @@ def _worker_main(
                 break
             cmd = item.get("cmd", "generate")
             if cmd == "load_weights_for_batch":
-                try:
-                    state_dict = item["state_dict"]
-                    target_model = item.get("model")
-                    if (
-                        isinstance(target_model, str)
-                        and resident_model is not None
-                        and resident_model == target_model
-                    ):
-                        # Active model already resident on this worker.
-                        resp_q.put({"ok": True, "skipped": True})
-                        continue
-                    # Prevent transient 2x peak memory on repeated loads:
-                    # drop current model tensors before staging the next state dict on GPU.
-                    _ = _evict_model_weights_to_meta(llm.engine.model, torch)
-                    # Todo: Instrument the overhead of this 
-                    torch.cuda.empty_cache()
-                    gpu_state_dict: dict[str, Any] = {}
-                    for name, tensor in state_dict.items():
-                        if not isinstance(tensor, torch.Tensor):
-                            raise TypeError(f"state_dict[{name}] must be torch.Tensor")
-                        gpu_state_dict[name] = tensor.to(device=llm.engine.device, non_blocking=True)
-                    llm.engine.model.load_state_dict(gpu_state_dict)
-                    resident_model = str(target_model) if isinstance(target_model, str) else model
-                    resp_q.put({"ok": True})
-                except Exception:
-                    resp_q.put({"ok": False, "err": traceback.format_exc()})
+                with nvtx_range("offline_colocate/worker/load_weights_cmd"):
+                    try:
+                        state_dict = item["state_dict"]
+                        target_model = item.get("model")
+                        if (
+                            isinstance(target_model, str)
+                            and resident_model is not None
+                            and resident_model == target_model
+                        ):
+                            # Active model already resident on this worker.
+                            resp_q.put({"ok": True, "skipped": True})
+                            continue
+                        # Prevent transient 2x peak memory on repeated loads:
+                        # drop current model tensors before staging the next state dict on GPU.
+                        with nvtx_range("offline_colocate/worker/evict_before_load"):
+                            _ = _evict_model_weights_to_meta(llm.engine.model, torch)
+                            torch.cuda.empty_cache()
+                        gpu_state_dict: dict[str, Any] = {}
+                        with nvtx_range("offline_colocate/worker/h2d_state_dict"):
+                            for name, tensor in state_dict.items():
+                                if not isinstance(tensor, torch.Tensor):
+                                    raise TypeError(f"state_dict[{name}] must be torch.Tensor")
+                                gpu_state_dict[name] = tensor.to(device=llm.engine.device, non_blocking=True)
+                        with nvtx_range("offline_colocate/worker/load_state_dict"):
+                            llm.engine.model.load_state_dict(gpu_state_dict)
+                        resident_model = str(target_model) if isinstance(target_model, str) else model
+                        resp_q.put({"ok": True})
+                    except Exception:
+                        resp_q.put({"ok": False, "err": traceback.format_exc()})
                 continue
             if cmd == "evict_weights":
-                try:
-                    evicted = _evict_model_weights_to_meta(llm.engine.model, torch)
-                    if evicted > 0:
-                        # Todo: Instrument the overhead of this 
-                        torch.cuda.empty_cache()
-                    resident_model = None
-                    resp_q.put({"ok": True, "evicted": int(evicted)})
-                except Exception:
-                    resp_q.put({"ok": False, "err": traceback.format_exc()})
+                with nvtx_range("offline_colocate/worker/evict_weights_cmd"):
+                    try:
+                        evicted = _evict_model_weights_to_meta(llm.engine.model, torch)
+                        if evicted > 0:
+                            torch.cuda.empty_cache()
+                        resident_model = None
+                        resp_q.put({"ok": True, "evicted": int(evicted)})
+                    except Exception:
+                        resp_q.put({"ok": False, "err": traceback.format_exc()})
                 continue
 
             prompts = item["prompts"]
@@ -211,28 +215,30 @@ def _worker_main(
             else:
                 sampling_params = SamplingParams(**payload)
 
-            try:
-                original_send = llm.send_result
-                token_timestamps: list[float] = []
-
-                def instrumented_send(reply: Any):
-                    now = time.perf_counter()
-                    try:
-                        for _ in reply:
-                            token_timestamps.append(now)
-                    except TypeError:
-                        pass
-                    return original_send(reply)
-
-                llm.send_result = instrumented_send
+            with nvtx_range("offline_colocate/worker/generate_cmd"):
                 try:
-                    out = llm.generate(prompts, sampling_params)
-                finally:
-                    llm.send_result = original_send
-                out = _attach_token_timestamps(out, token_timestamps)
-                resp_q.put({"ok": True, "out": out})
-            except Exception:
-                resp_q.put({"ok": False, "err": traceback.format_exc()})
+                    original_send = llm.send_result
+                    token_timestamps: list[float] = []
+
+                    def instrumented_send(reply: Any):
+                        now = time.perf_counter()
+                        try:
+                            for _ in reply:
+                                token_timestamps.append(now)
+                        except TypeError:
+                            pass
+                        return original_send(reply)
+
+                    llm.send_result = instrumented_send
+                    try:
+                        with nvtx_range("offline_colocate/worker/llm_generate"):
+                            out = llm.generate(prompts, sampling_params)
+                    finally:
+                        llm.send_result = original_send
+                    out = _attach_token_timestamps(out, token_timestamps)
+                    resp_q.put({"ok": True, "out": out})
+                except Exception:
+                    resp_q.put({"ok": False, "err": traceback.format_exc()})
     finally:
         try:
             llm.shutdown()
@@ -355,23 +361,24 @@ class MiniSGLMultiBackend:
         cmd_name: str,
         timeout_s: float = 30.0,
     ) -> dict[str, Any]:
-        deadline = time.time() + timeout_s
-        while True:
-            if not p.is_alive():
-                raise RuntimeError(
-                    f"mini-sgl worker died while waiting for '{cmd_name}' response "
-                    f"(exitcode={p.exitcode})"
-                )
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                raise TimeoutError(f"timed out waiting for worker response to '{cmd_name}'")
-            try:
-                msg = resp_q.get(timeout=min(1.0, remaining))
-                if not isinstance(msg, dict):
-                    raise RuntimeError(f"invalid worker response for '{cmd_name}': {type(msg)}")
-                return msg
-            except pyqueue.Empty:
-                continue
+        with nvtx_range(f"offline_colocate/backend/wait_worker_msg:{cmd_name}"):
+            deadline = time.time() + timeout_s
+            while True:
+                if not p.is_alive():
+                    raise RuntimeError(
+                        f"mini-sgl worker died while waiting for '{cmd_name}' response "
+                        f"(exitcode={p.exitcode})"
+                    )
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise TimeoutError(f"timed out waiting for worker response to '{cmd_name}'")
+                try:
+                    msg = resp_q.get(timeout=min(1.0, remaining))
+                    if not isinstance(msg, dict):
+                        raise RuntimeError(f"invalid worker response for '{cmd_name}': {type(msg)}")
+                    return msg
+                except pyqueue.Empty:
+                    continue
 
     @staticmethod
     def _send_load_weights(
@@ -401,85 +408,94 @@ class MiniSGLMultiBackend:
         return self.weight_manager.prepare_for_batch()
 
     def after_batch(self) -> None:
-        self.weight_manager.after_batch()
-        # Keep only the active model weights resident on GPU.
-        for m, worker in list(self._workers.items()):
-            if m == self._active_model:
-                continue
-            p, req_q, resp_q = worker
-            if not p.is_alive():
-                continue
-            self._send_evict_weights(p, req_q, resp_q)
+        with nvtx_range("offline_colocate/backend/after_batch"):
+            self.weight_manager.after_batch()
+            # Keep only the active model weights resident on GPU.
+            for m, worker in list(self._workers.items()):
+                if m == self._active_model:
+                    continue
+                p, req_q, resp_q = worker
+                if not p.is_alive():
+                    continue
+                with nvtx_range("offline_colocate/backend/after_batch_evict_other_model"):
+                    self._send_evict_weights(p, req_q, resp_q)
 
     def load_weights_for_batch(self, state_dict: TensorMap) -> None:
-        if self._active_model is None:
-            raise RuntimeError("Active model is not selected. Call select_model(model) first.")
-        if self._active_model not in self._workers:
-            self.select_model(self._active_model)
-        p, req_q, resp_q = self._workers[self._active_model]
-        if not p.is_alive():
-            raise RuntimeError(f"mini-sgl worker died for model: {self._active_model}")
-        self._send_load_weights(p, req_q, resp_q, self._active_model, state_dict)
+        with nvtx_range("offline_colocate/backend/load_weights_for_batch"):
+            if self._active_model is None:
+                raise RuntimeError("Active model is not selected. Call select_model(model) first.")
+            if self._active_model not in self._workers:
+                self.select_model(self._active_model)
+            p, req_q, resp_q = self._workers[self._active_model]
+            if not p.is_alive():
+                raise RuntimeError(f"mini-sgl worker died for model: {self._active_model}")
+            self._send_load_weights(p, req_q, resp_q, self._active_model, state_dict)
 
     def select_model(self, model: str) -> None:
-        self._step_counter += 1
-        prev_model = self._active_model
-        self._active_model = model
-        if model not in self._workers:
-            req_q: mp.Queue = self._ctx.Queue()
-            resp_q: mp.Queue = self._ctx.Queue()
-            idx = self._worker_counter
-            self._worker_counter += 1
-            p = self._ctx.Process(
-                target=_worker_main,
-                args=(
-                    model,
-                    self._memory_ratio,
-                    self._model_switching,
-                    self._model_switching_budget_model_path,
-                    self._compute_global_num_pages_override(model),
-                    self._use_dummy_weight,
-                    req_q,
-                    resp_q,
-                    idx,
-                ),
-                daemon=True,
-            )
-            p.start()
-            self._workers[model] = (p, req_q, resp_q)
-        p, req_q, resp_q = self._workers[model]
-        if not p.is_alive():
-            raise RuntimeError(f"mini-sgl worker died for model: {model}")
-        self._last_used_step[model] = self._step_counter
-        # On model switch, proactively evict previous model weights from GPU.
-        if prev_model and prev_model != model and prev_model in self._workers:
-            pp, preq, presp = self._workers[prev_model]
-            if pp.is_alive():
-                self._send_evict_weights(pp, preq, presp)
+        with nvtx_range(f"offline_colocate/backend/select_model:{model}"):
+            self._step_counter += 1
+            prev_model = self._active_model
+            self._active_model = model
+            if model not in self._workers:
+                req_q: mp.Queue = self._ctx.Queue()
+                resp_q: mp.Queue = self._ctx.Queue()
+                idx = self._worker_counter
+                self._worker_counter += 1
+                p = self._ctx.Process(
+                    target=_worker_main,
+                    args=(
+                        model,
+                        self._memory_ratio,
+                        self._model_switching,
+                        self._model_switching_budget_model_path,
+                        self._compute_global_num_pages_override(model),
+                        self._use_dummy_weight,
+                        req_q,
+                        resp_q,
+                        idx,
+                    ),
+                    daemon=True,
+                )
+                with nvtx_range("offline_colocate/backend/spawn_worker"):
+                    p.start()
+                self._workers[model] = (p, req_q, resp_q)
+            p, req_q, resp_q = self._workers[model]
+            if not p.is_alive():
+                raise RuntimeError(f"mini-sgl worker died for model: {model}")
+            self._last_used_step[model] = self._step_counter
+            # On model switch, proactively evict previous model weights from GPU.
+            if prev_model and prev_model != model and prev_model in self._workers:
+                pp, preq, presp = self._workers[prev_model]
+                if pp.is_alive():
+                    with nvtx_range("offline_colocate/backend/evict_prev_model_on_switch"):
+                        self._send_evict_weights(pp, preq, presp)
 
     def generate(self, prompts: list[list[int]], sampling_params: Any) -> Any:
-        if self._active_model is None:
-            raise RuntimeError("Active model is not selected. Call select_model(model) first.")
-        if self._active_model not in self._workers:
-            self.select_model(self._active_model)
-        p, req_q, resp_q = self._workers[self._active_model]
-        if not p.is_alive():
-            raise RuntimeError(f"mini-sgl worker died for model: {self._active_model}")
-        state_dict = self.prepare_for_batch()
-        self.load_weights_for_batch(state_dict)
-        try:
-            req_q.put(
-                {
-                    "prompts": prompts,
-                    "sampling_params": _sampling_to_payload(sampling_params),
-                }
-            )
-            msg = self._wait_worker_msg(p, resp_q, cmd_name="generate")
-            if not msg.get("ok", False):
-                raise RuntimeError(msg.get("err", "Unknown worker error"))
-            return msg["out"]
-        finally:
-            self.after_batch()
+        with nvtx_range("offline_colocate/backend/generate"):
+            if self._active_model is None:
+                raise RuntimeError("Active model is not selected. Call select_model(model) first.")
+            if self._active_model not in self._workers:
+                self.select_model(self._active_model)
+            p, req_q, resp_q = self._workers[self._active_model]
+            if not p.is_alive():
+                raise RuntimeError(f"mini-sgl worker died for model: {self._active_model}")
+            with nvtx_range("offline_colocate/backend/prepare_for_batch"):
+                state_dict = self.prepare_for_batch()
+            self.load_weights_for_batch(state_dict)
+            try:
+                with nvtx_range("offline_colocate/backend/send_generate_request"):
+                    req_q.put(
+                        {
+                            "prompts": prompts,
+                            "sampling_params": _sampling_to_payload(sampling_params),
+                        }
+                    )
+                msg = self._wait_worker_msg(p, resp_q, cmd_name="generate")
+                if not msg.get("ok", False):
+                    raise RuntimeError(msg.get("err", "Unknown worker error"))
+                return msg["out"]
+            finally:
+                self.after_batch()
 
     def shutdown(self) -> None:
         for model in list(self._workers.keys()):

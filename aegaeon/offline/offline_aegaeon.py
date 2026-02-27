@@ -11,6 +11,7 @@ from aegaeon.proxy.router import RequestEnvelope
 from aegaeon.runtime import InstanceRuntime
 from aegaeon.server.launch import build_local_instances
 from aegaeon.types import Request
+from aegaeon.utils import nvtx_range
 
 
 @dataclass(slots=True)
@@ -194,27 +195,29 @@ class OfflineAegaeon:
         return summary
 
     def _step_once(self) -> bool:
-        progressed = False
-        for instance_id, runtime in self.instances.items():
-            result = runtime.step()
-            if result is None:
-                self._publish_status(instance_id, runtime)
-                continue
-            progressed = True
-            now_ns = time.perf_counter_ns()
-            for request_id, output in result.outputs.items():
-                state = self._pending.get(request_id)
-                if state is None:
+        with nvtx_range("offline_colocate/offline_step_once"):
+            progressed = False
+            for instance_id, runtime in self.instances.items():
+                with nvtx_range(f"offline_colocate/runtime_step:{instance_id}"):
+                    result = runtime.step()
+                if result is None:
+                    self._publish_status(instance_id, runtime)
                     continue
-                self._record_emission(state, now_ns, output)
-                if state.instance_mode in {"decode", "colocated"}:
-                    state.remaining_steps = max(state.remaining_steps - 1, 0)
-                else:
-                    state.remaining_steps = 0
-                if state.remaining_steps == 0:
-                    self._finalize_request(state)
-            self._publish_status(instance_id, runtime)
-        return progressed
+                progressed = True
+                now_ns = time.perf_counter_ns()
+                for request_id, output in result.outputs.items():
+                    state = self._pending.get(request_id)
+                    if state is None:
+                        continue
+                    self._record_emission(state, now_ns, output)
+                    if state.instance_mode in {"decode", "colocated"}:
+                        state.remaining_steps = max(state.remaining_steps - 1, 0)
+                    else:
+                        state.remaining_steps = 0
+                    if state.remaining_steps == 0:
+                        self._finalize_request(state)
+                self._publish_status(instance_id, runtime)
+            return progressed
 
     def _record_emission(self, state: _OfflineRequestState, ts_ns: int, output: dict | object) -> None:
         token_count = self._count_tokens(output)

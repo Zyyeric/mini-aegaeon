@@ -14,6 +14,10 @@ _PROJECT_ROOT = _THIS_DIR.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from benchmark.trace_generator import TraceGenerator
+from benchmark.benchmark_core import RawResult, process_benchmark_results
+from transformers import AutoTokenizer
+
 
 def _percentile(values: list[float], p: float) -> float | None:
     if not values:
@@ -28,16 +32,6 @@ def _percentile(values: list[float], p: float) -> float | None:
         return s[lo]
     w = rank - lo
     return s[lo] * (1.0 - w) + s[hi] * w
-
-
-def _make_prompt(i: int, prompt_chars: int) -> str:
-    base = (
-        f"Request {i}: summarize how colocation scheduling impacts TTFT/TBT on L4 GPUs. "
-        "Return concise bullet points."
-    )
-    if len(base) >= prompt_chars:
-        return base[:prompt_chars]
-    return (base + " ") * (prompt_chars // (len(base) + 1)) + base[: prompt_chars % (len(base) + 1)]
 
 
 def _summary_stats(samples: list[float]) -> dict[str, float | None]:
@@ -205,16 +199,26 @@ def main() -> None:
                 raise SystemExit(f"No valid requests loaded from trace: {args.trace_json}")
             models = sorted({str(x["model"]) for x in trace_reqs})
         else:
+            prompt_tokenizer = AutoTokenizer.from_pretrained(models[0])
+            traces = TraceGenerator(
+                output_length=args.max_new_tokens,
+                start_timestamp=0.0,
+                interval_s=0.001,
+                jitter_s=0.0,
+                seed=args.seed,
+                tokenizer=prompt_tokenizer,
+                input_length=args.prompt_chars,
+            ).generate(args.num_requests)
             trace_reqs = []
-            for i in range(args.num_requests):
+            for i, trace in enumerate(traces):
                 model = _pick_model(i=i, models=models, policy=args.model_mix_policy, group_size=args.group_size)
                 trace_reqs.append(
                     {
                         "request_id": f"bench-{i}",
                         "model": model,
-                        "prompt": _make_prompt(i, args.prompt_chars),
-                        "max_new_tokens": args.max_new_tokens,
-                        "arrival_offset_ms": float(i),
+                        "prompt": trace.message,
+                        "max_new_tokens": int(trace.output_length),
+                        "arrival_offset_ms": float(trace.timestamp * 1000.0),
                     }
                 )
 
@@ -243,6 +247,22 @@ def main() -> None:
 
         completed = offline.run_until_complete(set(request_ids))
         t1 = time.perf_counter()
+        raw_records = offline.benchmark_raw_results(set(request_ids))
+        raw_for_processing = [
+            RawResult(
+                tics=[float(x) for x in rec.get("tics", [])],
+                output_len=int(rec.get("output_len", 0)),
+                message=str(rec.get("message", "")),
+                input_len=int(rec.get("input_len", 0)),
+            )
+            for rec in raw_records
+            if isinstance(rec, dict)
+        ]
+        if raw_for_processing:
+            try:
+                process_benchmark_results(raw_for_processing)
+            except ValueError:
+                pass
 
         by_model = offline.benchmark_by_model()
         ttft_samples_all: list[float] = []

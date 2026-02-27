@@ -12,8 +12,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from benchmark.benchmark_core import RawResult, process_benchmark_results
+from benchmark.trace_generator import TraceGenerator
 from minisgl.core import SamplingParams
-from minisgl.llm import LLM 
+from minisgl.llm import LLM
 from transformers import AutoTokenizer
 
 
@@ -129,17 +131,27 @@ def _run_one_model(
     llm.send_result = instrumented_send
 
     all_runs: list[RunMetrics] = []
+    raw_results: list[RawResult] = []
     try:
         if trace_reqs:
             requests = trace_reqs
         else:
+            base_trace = TraceGenerator(
+                output_length=output_tokens,
+                start_timestamp=0.0,
+                interval_s=0.001,
+                jitter_s=0.0,
+                seed=seed,
+                tokenizer=tokenizer,
+                input_length=prompt_len,
+            ).generate(runs)
             requests = [
                 {
                     "prompt_token_ids": prompt_ids,
-                    "max_new_tokens": output_tokens,
-                    "arrival_offset_ms": float(i),
+                    "max_new_tokens": int(x.output_length),
+                    "arrival_offset_ms": float(x.timestamp * 1000.0),
                 }
-                for i in range(runs)
+                for x in base_trace
             ]
 
         replay_t0 = time.perf_counter()
@@ -162,6 +174,14 @@ def _run_one_model(
             token_ids = out[0].get("token_ids", []) if out else []
             if not token_timestamps:
                 continue
+            raw_results.append(
+                RawResult(
+                    tics=list(token_timestamps),
+                    output_len=len(token_ids),
+                    message="",
+                    input_len=len(prompt_for_run),
+                )
+            )
             ttft_ms = (token_timestamps[0] - t0) * 1000.0
             tbts_ms = [
                 (token_timestamps[i + 1] - token_timestamps[i]) * 1000.0
@@ -182,6 +202,9 @@ def _run_one_model(
         del llm
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    if raw_results:
+        process_benchmark_results(raw_results)
 
     return all_runs, init_s
 

@@ -3,7 +3,60 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
+from dataclasses import dataclass
+from typing import Any
 from pathlib import Path
+
+_THIS_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _THIS_DIR.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from benchmark.benchmark_core import BenchmarkTrace, generate_prompt
+
+
+@dataclass(frozen=True)
+class TraceGenerator:
+    output_length: int = 64
+    start_timestamp: float = 0.0
+    interval_s: float = 0.5
+    jitter_s: float = 0.0
+    seed: int = 0
+    tokenizer: Any | None = None
+    input_length: int | None = None
+
+    def generate(self, num_requests: int) -> list[BenchmarkTrace]:
+        if num_requests <= 0:
+            raise ValueError("num_requests must be > 0")
+        if self.interval_s <= 0:
+            raise ValueError("interval_s must be > 0")
+        if self.jitter_s < 0:
+            raise ValueError("jitter_s must be >= 0")
+
+        rng = random.Random(self.seed)
+        traces: list[BenchmarkTrace] = []
+        for i in range(num_requests):
+            base_ts = self.start_timestamp + i * self.interval_s
+            ts = max(0.0, base_ts + rng.uniform(-self.jitter_s, self.jitter_s))
+            if self.input_length is not None and self.tokenizer is not None:
+                message = generate_prompt(self.tokenizer, self.input_length, rng=rng)
+            elif self.input_length is not None:
+                message = " ".join(["token"] * self.input_length)
+            else:
+                message = f"trace-{i}"
+            traces.append(
+                BenchmarkTrace(
+                    timestamp=ts,
+                    message=message,
+                    output_length=self.output_length,
+                    input_length=self.input_length,
+                )
+            )
+        return sorted(traces, key=lambda x: x.timestamp)
+
+
+BenchmarkTraceGenerator = TraceGenerator
 
 
 def main() -> None:
@@ -40,10 +93,18 @@ def main() -> None:
         models = [args.model]
 
     rng = random.Random(args.seed)
-    interval_ms = 1000.0 / args.arrival_rate_rps
+    interval_s = 1.0 / args.arrival_rate_rps
+    base_trace = TraceGenerator(
+        output_length=args.max_new_tokens,
+        start_timestamp=0.0,
+        interval_s=interval_s,
+        jitter_s=0.0,
+        seed=args.seed,
+        input_length=args.prompt_tokens,
+    ).generate(args.num_requests)
 
     trace: list[dict] = []
-    for i in range(args.num_requests):
+    for i, bt in enumerate(base_trace):
         if len(models) == 1:
             model = models[0]
         elif args.model_mix_policy == "random":
@@ -56,8 +117,8 @@ def main() -> None:
                 "request_id": f"trace-{i}",
                 "model": model,
                 "prompt_token_ids": prompt_token_ids,
-                "max_new_tokens": args.max_new_tokens,
-                "arrival_offset_ms": i * interval_ms,
+                "max_new_tokens": bt.output_length,
+                "arrival_offset_ms": bt.timestamp * 1000.0,
             }
         )
 

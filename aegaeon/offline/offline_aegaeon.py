@@ -22,6 +22,8 @@ class _OfflineRequestState:
     queued: bool
     enqueued_ns: int
     remaining_steps: int
+    input_len: int = 0
+    message: str = ""
     first_token_ns: int | None = None
     last_emit_ns: int | None = None
     emitted_tokens: int = 0
@@ -102,12 +104,12 @@ class OfflineAegaeon:
         prompt_token_ids = payload.get("prompt_token_ids")
         if prompt is None and isinstance(payload.get("messages"), list):
             prompt = " ".join(str(m.get("content", "")) for m in payload["messages"] if isinstance(m, dict))
+        prompt_text = str(prompt or "")
         if isinstance(prompt_token_ids, list) and prompt_token_ids:
             input_ids = [int(x) for x in prompt_token_ids if isinstance(x, int)]
             if not input_ids:
                 input_ids = [0]
         else:
-            prompt_text = str(prompt or "")
             input_ids = [ord(c) % 256 for c in prompt_text] or [0]
         uid = self.counter
         self.counter += 1
@@ -139,6 +141,8 @@ class OfflineAegaeon:
                 if runtime.cfg.mode in {"decode", "colocated"}
                 else 1
             ),
+            input_len=len(input_ids),
+            message=prompt_text,
         )
         return request_id
 
@@ -224,23 +228,59 @@ class OfflineAegaeon:
         completed_ns = state.last_emit_ns or time.perf_counter_ns()
         first_ns = state.first_token_ns or completed_ns
         ttft_ms = (first_ns - state.enqueued_ns) / 1_000_000.0
+        tics_ns: list[int] = []
+        if state.first_token_ns is not None:
+            tics_ns = [state.first_token_ns]
+            for delta in state.tbt_samples_ns:
+                tics_ns.append(tics_ns[-1] + max(int(delta), 1))
+        if not tics_ns and state.last_emit_ns is not None:
+            tics_ns = [state.last_emit_ns]
         self._completed[state.request_id] = {
             "request_id": state.request_id,
             "model": state.model,
             "instance_id": state.instance_id,
             "queued": state.queued,
             "output": state.output,
+            "message": state.message,
+            "input_len": state.input_len,
             "ttft_ms": ttft_ms,
             "tbt_ms_samples": [x / 1_000_000.0 for x in state.tbt_samples_ns],
+            "tbt_samples_ns": list(state.tbt_samples_ns),
             "tbt_ms_avg": (
                 (sum(state.tbt_samples_ns) / len(state.tbt_samples_ns) / 1_000_000.0)
                 if state.tbt_samples_ns
                 else None
             ),
             "tokens_emitted": state.emitted_tokens,
+            "enqueued_ns": state.enqueued_ns,
+            "first_token_ns": state.first_token_ns,
             "completed_ns": completed_ns,
+            "tics_ns": tics_ns,
+            "tics_s": [x / 1_000_000_000.0 for x in tics_ns],
         }
         self._pending.pop(state.request_id, None)
+
+    def benchmark_raw_results(self, request_ids: set[str] | None = None) -> list[dict]:
+        target = set(request_ids) if request_ids is not None else set(self._completed.keys())
+        out: list[dict] = []
+        for rid in target:
+            item = self._completed.get(rid)
+            if item is None:
+                continue
+            tics = item.get("tics_s", [])
+            if not isinstance(tics, list):
+                tics = []
+            out.append(
+                {
+                    "request_id": rid,
+                    "model": item.get("model"),
+                    "tics": [float(x) for x in tics if isinstance(x, (int, float))],
+                    "input_len": int(item.get("input_len", 0)),
+                    "output_len": int(item.get("tokens_emitted", 0)),
+                    "message": str(item.get("message", "")),
+                }
+            )
+        return out
 
     def _publish_status(self, instance_id: str, runtime: InstanceRuntime) -> None:
         scheduler_stats = runtime.stats().get("scheduler", {})

@@ -146,7 +146,7 @@ generate_trace_for_model() {
   local model_ref="$1"
   local trace_json="$2"
   local trace_seed="$3"
-  python benchmark/generate_request_trace.py \
+  python benchmark/trace_generator.py \
     --model "${model_ref}" \
     --num-requests "${RUNS}" \
     --prompt-tokens "${PROMPT_LENGTH}" \
@@ -227,7 +227,7 @@ run_asymcompute() {
   local n_mig="${#migs[@]}"
   local wave_count=$(( (total + n_mig - 1) / n_mig ))
 
-  python benchmark/generate_request_trace.py \
+  python benchmark/trace_generator.py \
     --models "${joined_models}" \
     --model-mix-policy round_robin \
     --num-requests "${NUM_REQUESTS}" \
@@ -274,7 +274,7 @@ PY
 
       echo "  wave=${wave} slot=${i} model=${model} mig=${mig} port=${port}"
       CUDA_VISIBLE_DEVICES="${mig}" MASTER_PORT="${port}" \
-      python benchmark/benchmark_minisglang_offload.py \
+      python benchmark/benchmark_asym_compute.py \
         --models "${model}" \
         --trace-json "${trace_json}" \
         --prompt-length "${PROMPT_LENGTH}" \
@@ -378,7 +378,7 @@ run_aegaeon() {
   local joined_models
   joined_models="$(IFS=,; echo "${model_refs[*]}")"
 
-  python benchmark/generate_request_trace.py \
+  python benchmark/trace_generator.py \
     --models "${joined_models}" \
     --model-mix-policy round_robin \
     --num-requests "${NUM_REQUESTS}" \

@@ -174,7 +174,7 @@ def main() -> None:
             env["MASTER_PORT"] = str(args.master_port_base + i)
             cmd = [
                 sys.executable,
-                "benchmark/benchmark_minisglang_offload.py",
+                "benchmark/benchmark_asym_compute.py",
                 "--models",
                 model,
                 "--prompt-length",
@@ -199,7 +199,7 @@ def main() -> None:
             if rc != 0:
                 raise RuntimeError(f"mini-sglang run failed for model={model}, out={out_json}, rc={rc}")
 
-    minisgl_merged_json = results_dir / "minisglang_offload_merged.json"
+    minisgl_merged_json = results_dir / "asymcompute_merged.json"
     _merge_minisglang_reports(
         report_paths=minisgl_reports,
         out_json=minisgl_merged_json,
@@ -249,7 +249,7 @@ def main() -> None:
     _run(cmd=cmd, cwd=repo_root, env=os.environ.copy())
 
     print("\nExperiment completed.")
-    print(f"- mini-sglang merged: {minisgl_merged_json}")
+    print(f"- asymCompute merged: {minisgl_merged_json}")
     print(f"- mini-aegaeon:       {aegaeon_json}")
     print(f"- plots:              {plots_dir}")
 

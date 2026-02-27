@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import queue as pyqueue
 import time
 import traceback
@@ -265,7 +266,7 @@ class MiniSGLMultiBackend:
         use_dummy_weight: bool = False,
     ) -> None:
         self._memory_ratio = memory_ratio
-        _ = max_live_workers
+        self._max_live_workers = max_live_workers if (max_live_workers is None or max_live_workers > 0) else 1
         self._model_switching = bool(model_switching)
         self._model_switching_budget_model_path = model_switching_budget_model_path
         self._global_kv_budget_models = list(global_kv_budget_models or [])
@@ -359,9 +360,11 @@ class MiniSGLMultiBackend:
         resp_q: mp.Queue,
         *,
         cmd_name: str,
-        timeout_s: float = 30.0,
+        timeout_s: float | None = None,
     ) -> dict[str, Any]:
         with nvtx_range(f"offline_colocate/backend/wait_worker_msg:{cmd_name}"):
+            if timeout_s is None:
+                timeout_s = float(os.getenv("AEGAEON_WORKER_TIMEOUT_S", "300"))
             deadline = time.time() + timeout_s
             while True:
                 if not p.is_alive():
@@ -437,6 +440,14 @@ class MiniSGLMultiBackend:
             prev_model = self._active_model
             self._active_model = model
             if model not in self._workers:
+                if self._max_live_workers is not None:
+                    while len(self._workers) >= self._max_live_workers:
+                        # Evict least-recently-used non-target worker before spawning a new one.
+                        victims = [m for m in self._workers.keys() if m != model]
+                        if not victims:
+                            break
+                        victim = min(victims, key=lambda m: self._last_used_step.get(m, -1))
+                        self._stop_worker(victim)
                 req_q: mp.Queue = self._ctx.Queue()
                 resp_q: mp.Queue = self._ctx.Queue()
                 idx = self._worker_counter

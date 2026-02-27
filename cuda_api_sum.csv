@@ -1,0 +1,8 @@
+
+NOTICE: Existing SQLite export found: benchmark/results/nsys_qwen3_local.sqlite
+        It is assumed file was previously exported from: benchmark/results/nsys_qwen3_local.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [benchmark/results/nsys_qwen3_local.sqlite] with [/lambda/nfs/serverlessOnSuperchip/nsight-systems/2025.1.1/host-linux-armv8/reports/cuda_api_sum.py]... 
+SKIPPED: benchmark/results/nsys_qwen3_local.sqlite does not contain CUDA trace data.
+

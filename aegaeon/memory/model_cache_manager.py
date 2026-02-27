@@ -57,10 +57,9 @@ class ModelCacheManager(WeightManager):
             return moved_state
 
     def after_batch(self) -> None:
-        with nvtx_range("offline_colocate/weights/prepare_for_batch"):
+        with nvtx_range("offline_colocate/weights/after_batch"):
+            if self._batch_state_dict is None:
+                return
 
-        if self._batch_state_dict is None:
-            return
-
-        # ModelCache remains the source of truth. Release per-batch materialization.
-        self._batch_state_dict = None
+            # ModelCache remains the source of truth. Release per-batch materialization.
+            self._batch_state_dict = None

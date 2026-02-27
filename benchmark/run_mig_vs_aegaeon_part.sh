@@ -19,7 +19,8 @@ MIG_COUNT=3
 MIG_UUIDS=""
 MASTER_PORT_BASE=29600
 
-MODELS="meta-llama/Llama-2-13b-hf,meta-llama/Llama-2-13b-chat-hf,Qwen/Qwen1.5-14B,Qwen/Qwen1.5-14B-Chat,Qwen/Qwen3-14B"
+# Keep defaults small enough for 24GB MIG slices.
+MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-1.7B,Qwen/Qwen3-4B"
 MODEL_SOURCE="local" # local | hf
 LOCAL_ROOT="benchmark/local_models"
 PREDOWNLOAD=0
@@ -36,8 +37,10 @@ MODEL_CACHE_BUDGET_GB=84
 BACKEND_MEMORY_RATIO=0.5
 BACKEND_MAX_LIVE_WORKERS=1
 BACKEND_MODEL_SWITCHING=0
+BACKEND_MODEL=""
+TTFT_SUBTRACT_MS=0
 SEED=0
-RESULTS_DIR="benchmark/results/mig_vs_aegaeon_13b"
+RESULTS_DIR="benchmark/results/mig_vs_aegaeon_qwen3_24gb"
 
 usage() {
   cat <<EOF
@@ -46,11 +49,11 @@ Usage:
 
 Core options:
   --part <name>                     Which part to run
-  --models "<csv>"                  Model ids (default: 13B/14B set)
+  --models "<csv>"                  Model ids (default: Qwen3 0.6B/1.7B/4B)
   --model-source <local|hf>         Use local snapshots or HF ids (default: local)
   --local-root <path>               Local snapshot root (default: benchmark/local_models)
   --predownload                     Pre-download models before sglang/aegaeon run (local mode)
-  --results-dir <path>              Output directory (default: benchmark/results/mig_vs_aegaeon_13b)
+  --results-dir <path>              Output directory (default: benchmark/results/mig_vs_aegaeon_qwen3_24gb)
 
 MIG control:
   --gpu-index <int>                 GPU index for MIG commands (default: 0)
@@ -72,6 +75,8 @@ Benchmark knobs:
   --backend-memory-ratio <float>    Aegaeon mini-sgl backend memory ratio (default: 0.5)
   --backend-max-live-workers <int>  Max concurrently live Aegaeon backend model workers (default: 1)
   --backend-model-switching         Enable mini-sgl model-switching memory policy
+  --backend-model <model_or_path>   Budget-model path used by model-switching reserve (default: auto)
+  --ttft-subtract-ms <float>        Subtract fixed ms from each TTFT sample in Aegaeon report
   --seed <int>                      Random seed (default: 0)
 
 Examples:
@@ -107,6 +112,8 @@ while [[ $# -gt 0 ]]; do
     --backend-memory-ratio) BACKEND_MEMORY_RATIO="$2"; shift 2 ;;
     --backend-max-live-workers) BACKEND_MAX_LIVE_WORKERS="$2"; shift 2 ;;
     --backend-model-switching) BACKEND_MODEL_SWITCHING=1; shift 1 ;;
+    --backend-model) BACKEND_MODEL="$2"; shift 2 ;;
+    --ttft-subtract-ms) TTFT_SUBTRACT_MS="$2"; shift 2 ;;
     --seed) SEED="$2"; shift 2 ;;
     --results-dir) RESULTS_DIR="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -125,7 +132,17 @@ mkdir -p "${RESULTS_DIR}"
 split_csv_to_array() {
   local csv="$1"
   local -n out_arr="$2"
-  IFS=',' read -r -a out_arr <<< "${csv}"
+  local raw_arr item
+  IFS=',' read -r -a raw_arr <<< "${csv}"
+  out_arr=()
+  for item in "${raw_arr[@]}"; do
+    # Trim leading/trailing whitespace in each CSV field.
+    item="${item#"${item%%[![:space:]]*}"}"
+    item="${item%"${item##*[![:space:]]}"}"
+    if [[ -n "${item}" ]]; then
+      out_arr+=("${item}")
+    fi
+  done
 }
 
 build_model_refs() {
@@ -146,7 +163,7 @@ generate_trace_for_model() {
   local model_ref="$1"
   local trace_json="$2"
   local trace_seed="$3"
-  python benchmark/trace_generator.py \
+  python -m benchmark.trace_generator \
     --model "${model_ref}" \
     --num-requests "${RUNS}" \
     --prompt-tokens "${PROMPT_LENGTH}" \
@@ -159,7 +176,7 @@ generate_trace_for_model() {
 predownload_if_requested() {
   local models_csv="$1"
   if [[ "${PREDOWNLOAD}" -eq 1 && "${MODEL_SOURCE}" == "local" ]]; then
-    python benchmark/predownload_models.py --models "${models_csv}" --local-root "${LOCAL_ROOT}"
+    python -m benchmark.predownload_models --models "${models_csv}" --local-root "${LOCAL_ROOT}"
   fi
 }
 
@@ -167,22 +184,33 @@ run_mig_on() {
   echo "[MIG ON] Enabling MIG on GPU ${GPU_INDEX} and creating ${MIG_COUNT} partition(s) profile ${MIG_PROFILE_ID}"
   sudo nvidia-smi -i "${GPU_INDEX}" -mig 1
   sleep 2
-  sudo nvidia-smi mig -i "${GPU_INDEX}" -dci || true
-  sudo nvidia-smi mig -i "${GPU_INDEX}" -dgi || true
+  # Best-effort cleanup; suppress expected "No GPU instances found" noise.
+  sudo nvidia-smi mig -i "${GPU_INDEX}" -dci >/dev/null 2>&1 || true
+  sudo nvidia-smi mig -i "${GPU_INDEX}" -dgi >/dev/null 2>&1 || true
   sleep 2
-  local profiles
-  profiles="$(yes "${MIG_PROFILE_ID}" | head -n "${MIG_COUNT}" | paste -sd, -)"
+  local profiles=""
+  local i
+  for ((i=0; i<MIG_COUNT; i++)); do
+    if [[ -n "${profiles}" ]]; then
+      profiles+=","
+    fi
+    profiles+="${MIG_PROFILE_ID}"
+  done
   sudo nvidia-smi mig -i "${GPU_INDEX}" -cgi "${profiles}" -C
   sleep 2
   nvidia-smi -L
+  if ! nvidia-smi -L | grep -q "MIG-"; then
+    echo "MIG mode is enabled but no MIG UUIDs were detected. A reboot or driver reset may be required."
+    return 1
+  fi
   echo "Collect MIG UUIDs with:"
   echo "  nvidia-smi -L | grep MIG | grep -o 'MIG-[^)]*'"
 }
 
 run_mig_off() {
   echo "[MIG OFF] Destroying MIG instances and disabling MIG on GPU ${GPU_INDEX}"
-  sudo nvidia-smi mig -i "${GPU_INDEX}" -dci || true
-  sudo nvidia-smi mig -i "${GPU_INDEX}" -dgi || true
+  sudo nvidia-smi mig -i "${GPU_INDEX}" -dci >/dev/null 2>&1 || true
+  sudo nvidia-smi mig -i "${GPU_INDEX}" -dgi >/dev/null 2>&1 || true
   sleep 2
   sudo nvidia-smi -i "${GPU_INDEX}" -mig 0
   sleep 2
@@ -204,6 +232,27 @@ run_asymcompute() {
     echo "No MIG UUIDs parsed from --mig-uuids"
     exit 1
   fi
+  for mig in "${migs[@]}"; do
+    if [[ "${mig}" != MIG-* ]]; then
+      echo "Invalid MIG UUID entry: '${mig}' (expected to start with MIG-)"
+      exit 1
+    fi
+  done
+  local current_migs
+  current_migs="$(nvidia-smi -L | grep -o 'MIG-[^)]*' || true)"
+  if [[ -z "${current_migs}" ]]; then
+    echo "No MIG UUIDs currently visible from 'nvidia-smi -L'. Is MIG enabled and configured?"
+    exit 1
+  fi
+  for mig in "${migs[@]}"; do
+    if ! grep -Fxq "${mig}" <<< "${current_migs}"; then
+      echo "Requested MIG UUID not found on this host: ${mig}"
+      echo "Current MIG UUIDs:"
+      echo "${current_migs}"
+      echo "Run: nvidia-smi -L | grep MIG | grep -o 'MIG-[^)]*'"
+      exit 1
+    fi
+  done
 
   local per_model_dir="${RESULTS_DIR}/asymcompute_per_model"
   local trace_dir="${RESULTS_DIR}/request_traces"
@@ -227,7 +276,7 @@ run_asymcompute() {
   local n_mig="${#migs[@]}"
   local wave_count=$(( (total + n_mig - 1) / n_mig ))
 
-  python benchmark/trace_generator.py \
+  python -m benchmark.trace_generator \
     --models "${joined_models}" \
     --model-mix-policy round_robin \
     --num-requests "${NUM_REQUESTS}" \
@@ -256,8 +305,10 @@ for model, items in by_model.items():
 PY
 
   echo "[ASYMCOMPUTE] Running ${total} model(s) across ${n_mig} MIG partition(s) in ${wave_count} wave(s)"
+  echo "[ASYMCOMPUTE] Start time: $(date -Is)"
 
   for ((wave=0; wave<wave_count; wave++)); do
+    echo "[ASYMCOMPUTE] Wave $((wave + 1))/${wave_count} launching..."
     pids=()
     for ((i=0; i<n_mig; i++)); do
       idx=$(( wave * n_mig + i ))
@@ -274,7 +325,7 @@ PY
 
       echo "  wave=${wave} slot=${i} model=${model} mig=${mig} port=${port}"
       CUDA_VISIBLE_DEVICES="${mig}" MASTER_PORT="${port}" \
-      python benchmark/benchmark_asym_compute.py \
+      python -m benchmark.benchmark_asym_compute \
         --models "${model}" \
         --trace-json "${trace_json}" \
         --prompt-length "${PROMPT_LENGTH}" \
@@ -285,12 +336,15 @@ PY
         --out-json "${out_json}" &
       pids+=("$!")
     done
+    echo "[ASYMCOMPUTE] Wave $((wave + 1))/${wave_count} waiting for ${#pids[@]} worker(s)..."
     for pid in "${pids[@]}"; do
       wait "${pid}"
     done
+    echo "[ASYMCOMPUTE] Wave $((wave + 1))/${wave_count} completed at $(date -Is)"
   done
 
   local merged_json="${RESULTS_DIR}/asymcompute_merged.json"
+  echo "[ASYMCOMPUTE] Merging per-model reports into ${merged_json}"
   python - "${per_model_dir}" "${merged_json}" "${PROMPT_LENGTH}" "${OUTPUT_TOKENS}" "${RUNS}" <<'PY'
 import json
 import math
@@ -353,6 +407,8 @@ merged = {
 merged_json.write_text(json.dumps(merged, indent=2), encoding="utf-8")
 print(json.dumps({"merged_json": str(merged_json), "models": merged["models"]}, indent=2))
 PY
+  echo "[ASYMCOMPUTE] Finished at $(date -Is)"
+  echo "[ASYMCOMPUTE] Saved: ${merged_json}"
 }
 
 run_aegaeon() {
@@ -376,9 +432,10 @@ run_aegaeon() {
   mkdir -p "${trace_dir}"
   local mixed_trace_json="${trace_dir}/mixed_aegaeon_trace.json"
   local joined_models
+  local backend_model_arg=""
   joined_models="$(IFS=,; echo "${model_refs[*]}")"
 
-  python benchmark/trace_generator.py \
+  python -m benchmark.trace_generator \
     --models "${joined_models}" \
     --model-mix-policy round_robin \
     --num-requests "${NUM_REQUESTS}" \
@@ -388,18 +445,40 @@ run_aegaeon() {
     --seed "${SEED}" \
     --out-json "${mixed_trace_json}" >/dev/null
 
+  if [[ "${BACKEND_MODEL_SWITCHING}" -eq 1 ]]; then
+    if [[ -n "${BACKEND_MODEL}" ]]; then
+      backend_model_arg="--backend-model ${BACKEND_MODEL}"
+    elif [[ "${MODEL_SOURCE}" == "local" ]]; then
+      local max_bytes=-1
+      local chosen_model=""
+      local m m_bytes
+      for m in "${model_refs[@]}"; do
+        m_bytes="$(du -sb "${m}" | awk '{print $1}')"
+        if [[ "${m_bytes}" =~ ^[0-9]+$ ]] && (( m_bytes > max_bytes )); then
+          max_bytes="${m_bytes}"
+          chosen_model="${m}"
+        fi
+      done
+      if [[ -n "${chosen_model}" ]]; then
+        backend_model_arg="--backend-model ${chosen_model}"
+      fi
+    fi
+  fi
+
   echo "[AEGAEON] Running mixed-model replay with max live backend workers=${BACKEND_MAX_LIVE_WORKERS} on CUDA_VISIBLE_DEVICES=${AEGAEON_CUDA_DEVICES}"
   CUDA_VISIBLE_DEVICES="${AEGAEON_CUDA_DEVICES}" \
-  python benchmark/offline_qwen3_colocation.py \
+  python -m benchmark.offline_qwen3_colocation \
     --models "${joined_models}" \
     --trace-json "${mixed_trace_json}" \
     --backend mini_sgl \
     --backend-memory-ratio "${BACKEND_MEMORY_RATIO}" \
     --backend-max-live-workers "${BACKEND_MAX_LIVE_WORKERS}" \
     $([[ "${BACKEND_MODEL_SWITCHING}" -eq 1 ]] && echo "--backend-model-switching") \
+    ${backend_model_arg} \
     --max-new-tokens "${OUTPUT_TOKENS}" \
     --colocated-count "${COLOCATED_COUNT}" \
     --model-cache-budget-gb "${MODEL_CACHE_BUDGET_GB}" \
+    --ttft-subtract-ms "${TTFT_SUBTRACT_MS}" \
     --seed "${SEED}" \
     --out-json "${out_json}"
 
@@ -424,7 +503,7 @@ run_plot() {
       exit 1
     fi
   fi
-  python benchmark/plot_ttft_tbt_compare.py \
+  python -m benchmark.plot_ttft_tbt_compare \
     --aegaeon-json "${aeg_json}" \
     --asymcompute-json "${asym_json}" \
     --out-dir "${out_dir}"

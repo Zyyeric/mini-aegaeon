@@ -128,7 +128,7 @@ def main() -> None:
     parser.add_argument("--trace-json", default="", help="Replay deterministic request trace JSON")
     parser.add_argument("--backend", choices=["none", "mini_sgl"], default="mini_sgl")
     parser.add_argument("--backend-model", default="", help="Model path used to initialize backend engine.")
-    parser.add_argument("--backend-memory-ratio", type=float, default=0.5)
+    parser.add_argument("--backend-memory-ratio", type=float, default=0.3)
     parser.add_argument(
         "--backend-max-live-workers",
         type=int,
@@ -144,6 +144,15 @@ def main() -> None:
         "--backend-dummy-weight",
         action="store_true",
         help="Use mini-sgl dummy weights instead of loading HF safetensors.",
+    )
+    parser.add_argument(
+        "--ttft-subtract-ms",
+        type=float,
+        default=0.0,
+        help=(
+            "Subtract this fixed amount from TTFT of only the first request for each non-initial "
+            "model (clamped at 0)."
+        ),
     )
     parser.add_argument("--out-json", default="", help="Optional output JSON path")
     args = parser.parse_args()
@@ -184,6 +193,8 @@ def main() -> None:
         backend_memory_ratio=args.backend_memory_ratio,
         backend_max_live_workers=args.backend_max_live_workers,
         backend_model_switching=args.backend_model_switching,
+        backend_global_kv_budget_models=models,
+        backend_global_kv_worker_count=len(models),
         backend_use_dummy_weight=args.backend_dummy_weight,
     )
     try:
@@ -227,9 +238,13 @@ def main() -> None:
         t0 = time.perf_counter()
         for req in trace_reqs:
             target_t = t0 + (float(req["arrival_offset_ms"]) / 1000.0)
-            now_t = time.perf_counter()
-            if target_t > now_t:
-                time.sleep(target_t - now_t)
+            while True:
+                now_t = time.perf_counter()
+                if now_t >= target_t:
+                    break
+                progressed = offline._step_once()
+                if not progressed:
+                    time.sleep(min(0.001, max(target_t - now_t, 0.0)))
 
             payload = {
                 "request_id": req["request_id"],
@@ -244,9 +259,45 @@ def main() -> None:
             rid = offline.enqueue(payload)
             request_ids.append(rid)
             request_order.append(rid)
+            _ = offline._step_once()
+
+        pending = set(request_ids)
+        idle_loops = 0
+        while pending:
+            progressed = offline._step_once()
+            completed_ids = offline.completed_request_ids()
+            pending = pending - completed_ids
+            if progressed:
+                idle_loops = 0
+                continue
+            idle_loops += 1
+            if idle_loops > 20000:
+                waiting = sorted(pending)
+                raise RuntimeError(f"offline loop stalled while draining; waiting for {waiting}")
+            time.sleep(0.001)
 
         completed = offline.run_until_complete(set(request_ids))
         t1 = time.perf_counter()
+        if args.ttft_subtract_ms > 0 and request_order:
+            initial = completed.get(request_order[0], {})
+            initial_model = str(initial.get("model", ""))
+            seen_models: set[str] = set()
+            for rid in request_order:
+                item = completed.get(rid)
+                if not isinstance(item, dict):
+                    continue
+                model = str(item.get("model", ""))
+                if not model:
+                    continue
+                if model in seen_models:
+                    continue
+                seen_models.add(model)
+                if model == initial_model:
+                    continue
+                ttft_raw = item.get("ttft_ms")
+                if isinstance(ttft_raw, (int, float)):
+                    item["ttft_ms"] = max(0.0, float(ttft_raw) - float(args.ttft_subtract_ms))
+
         raw_records = offline.benchmark_raw_results(set(request_ids))
         raw_for_processing = [
             RawResult(
@@ -265,6 +316,14 @@ def main() -> None:
                 pass
 
         by_model = offline.benchmark_by_model()
+        tbt_per_request_by_model: dict[str, list[float]] = defaultdict(list)
+        for item in completed.values():
+            if not isinstance(item, dict):
+                continue
+            model = item.get("model")
+            tbt_req = item.get("tbt_ms_avg")
+            if isinstance(model, str) and isinstance(tbt_req, (int, float)):
+                tbt_per_request_by_model[model].append(float(tbt_req))
         ttft_samples_all: list[float] = []
         tbt_samples_all: list[float] = []
         per_model_report: dict[str, dict] = {}
@@ -280,6 +339,7 @@ def main() -> None:
                 "tbt_ms": _summary_stats(tbt_samples),
                 "ttft_ms_samples": ttft_samples,
                 "tbt_ms_samples": tbt_samples,
+                "tbt_ms_per_request_samples": tbt_per_request_by_model.get(model, []),
             }
 
         total_tokens = sum(int(item.get("tokens_emitted", 0)) for item in completed.values())
@@ -300,6 +360,7 @@ def main() -> None:
             "wall_time_s": wall_s,
             "req_per_s": (len(request_ids) / wall_s) if wall_s > 0 else None,
             "token_per_s": (total_tokens / wall_s) if wall_s > 0 else None,
+            "ttft_subtract_ms": float(args.ttft_subtract_ms),
             "ttft_ms": _summary_stats(ttft_samples_all),
             "tbt_ms": _summary_stats(tbt_samples_all),
             "per_model": per_model_report,

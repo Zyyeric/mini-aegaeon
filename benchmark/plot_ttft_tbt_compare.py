@@ -37,6 +37,38 @@ def _pick_metric(report: dict, model_key: str, metric: str) -> float | None:
     return None
 
 
+def _pick_samples(report: dict, model_key: str, metric: str) -> list[float]:
+    per_model = report.get("per_model", {}).get(model_key, {})
+    if metric == "tbt_ms":
+        # Prefer per-request TBT samples when present (mini-aegaeon),
+        # to match asymCompute granularity more closely.
+        preferred = per_model.get("tbt_ms_per_request_samples")
+        if isinstance(preferred, list):
+            out_pref: list[float] = []
+            for x in preferred:
+                if isinstance(x, (int, float)):
+                    out_pref.append(float(x))
+            if out_pref:
+                return out_pref
+    key = f"{metric}_samples"
+    raw = per_model.get(key, [])
+    if not isinstance(raw, list):
+        return []
+    out: list[float] = []
+    for x in raw:
+        if isinstance(x, (int, float)):
+            out.append(float(x))
+    return out
+
+
+def _ecdf(values: list[float]) -> tuple[np.ndarray, np.ndarray]:
+    if not values:
+        return np.array([]), np.array([])
+    x = np.sort(np.array(values, dtype=float))
+    y = np.arange(1, len(x) + 1, dtype=float) / float(len(x))
+    return x, y
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Plot TTFT/TBT per model comparing mini-aegaeon vs AsymCompute"
@@ -112,6 +144,56 @@ def main() -> None:
     fig2.savefig(tbt_png, dpi=180)
     plt.close(fig2)
 
+    aeg_ttft_samples_all: list[float] = []
+    asym_ttft_samples_all: list[float] = []
+    aeg_tbt_samples_all: list[float] = []
+    asym_tbt_samples_all: list[float] = []
+    for m in models:
+        aeg_ttft_samples_all.extend(_pick_samples(aeg, aeg_map[m], "ttft_ms"))
+        asym_ttft_samples_all.extend(_pick_samples(asym, asym_map[m], "ttft_ms"))
+        aeg_tbt_samples_all.extend(_pick_samples(aeg, aeg_map[m], "tbt_ms"))
+        asym_tbt_samples_all.extend(_pick_samples(asym, asym_map[m], "tbt_ms"))
+
+    fig3, ax3 = plt.subplots(figsize=(9, 5))
+    x_aeg_ttft, y_aeg_ttft = _ecdf(aeg_ttft_samples_all)
+    x_asym_ttft, y_asym_ttft = _ecdf(asym_ttft_samples_all)
+    if len(x_aeg_ttft) > 0:
+        ax3.plot(x_aeg_ttft, y_aeg_ttft, label="mini-aegaeon")
+    if len(x_asym_ttft) > 0:
+        ax3.plot(x_asym_ttft, y_asym_ttft, label="AsymCompute")
+    ax3.set_title("TTFT CDF")
+    ax3.set_xlabel("TTFT (ms)")
+    ax3.set_ylabel("CDF")
+    ax3.grid(alpha=0.3)
+    ax3.legend()
+    fig3.tight_layout()
+    ttft_cdf_png = out_dir / "ttft_cdf.png"
+    fig3.savefig(ttft_cdf_png, dpi=180)
+    plt.close(fig3)
+
+    fig4, ax4 = plt.subplots(figsize=(9, 5))
+    x_aeg_tbt, y_aeg_tbt = _ecdf(aeg_tbt_samples_all)
+    x_asym_tbt, y_asym_tbt = _ecdf(asym_tbt_samples_all)
+    if len(x_aeg_tbt) > 0:
+        ax4.plot(x_aeg_tbt, y_aeg_tbt, label="mini-aegaeon")
+    if len(x_asym_tbt) > 0:
+        ax4.plot(x_asym_tbt, y_asym_tbt, label="AsymCompute")
+    finite_tbt_samples = [v for v in (aeg_tbt_samples_all + asym_tbt_samples_all) if v > 0]
+    if finite_tbt_samples:
+        tbt_min = min(finite_tbt_samples)
+        tbt_max = max(finite_tbt_samples)
+        if tbt_min > 0 and (tbt_max / tbt_min) >= 20.0:
+            ax4.set_xscale("log")
+    ax4.set_title("TBT CDF")
+    ax4.set_xlabel("TBT (ms)")
+    ax4.set_ylabel("CDF")
+    ax4.grid(alpha=0.3)
+    ax4.legend()
+    fig4.tight_layout()
+    tbt_cdf_png = out_dir / "tbt_cdf.png"
+    fig4.savefig(tbt_cdf_png, dpi=180)
+    plt.close(fig4)
+
     merged = {
         "models": models,
         "mini_aegaeon": {
@@ -125,6 +207,8 @@ def main() -> None:
         "artifacts": {
             "ttft_plot": str(ttft_png),
             "tbt_plot": str(tbt_png),
+            "ttft_cdf_plot": str(ttft_cdf_png),
+            "tbt_cdf_plot": str(tbt_cdf_png),
         },
     }
     merged_json = out_dir / "comparison_merged.json"

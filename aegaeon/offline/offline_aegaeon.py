@@ -26,6 +26,7 @@ class _OfflineRequestState:
     message: str = ""
     first_token_ns: int | None = None
     last_emit_ns: int | None = None
+    last_token_ts_s: float | None = None
     emitted_tokens: int = 0
     tbt_samples_ns: list[int] = field(default_factory=list)
     output: dict | None = None
@@ -47,6 +48,8 @@ class OfflineAegaeon:
         backend_memory_ratio: float = 0.5,
         backend_max_live_workers: int | None = None,
         backend_model_switching: bool = False,
+        backend_global_kv_budget_models: list[str] | None = None,
+        backend_global_kv_worker_count: int | None = None,
         backend_use_dummy_weight: bool = False,
     ) -> None:
         self.proxy = Proxy._build(
@@ -69,6 +72,8 @@ class OfflineAegaeon:
             backend_memory_ratio=backend_memory_ratio,
             backend_max_live_workers=backend_max_live_workers,
             backend_model_switching=backend_model_switching,
+            backend_global_kv_budget_models=backend_global_kv_budget_models,
+            backend_global_kv_worker_count=backend_global_kv_worker_count,
             backend_use_dummy_weight=backend_use_dummy_weight,
         )
         self.counter = 0
@@ -214,6 +219,25 @@ class OfflineAegaeon:
     def _record_emission(self, state: _OfflineRequestState, ts_ns: int, output: dict | object) -> None:
         token_count = self._count_tokens(output)
         state.output = output if isinstance(output, dict) else {"result": output}
+        token_ts = self._extract_token_timestamps_s(output)
+        if token_ts:
+            if state.first_token_ns is None:
+                state.first_token_ns = ts_ns
+            prev = state.last_token_ts_s
+            if prev is not None:
+                delta_ns = int((token_ts[0] - prev) * 1_000_000_000.0)
+                if delta_ns > 0:
+                    state.tbt_samples_ns.append(delta_ns)
+            for i in range(len(token_ts) - 1):
+                delta_ns = int((token_ts[i + 1] - token_ts[i]) * 1_000_000_000.0)
+                if delta_ns > 0:
+                    state.tbt_samples_ns.append(delta_ns)
+            state.last_token_ts_s = token_ts[-1]
+            state.last_emit_ns = ts_ns
+            state.emitted_tokens += max(len(token_ts), 0)
+            return
+
+        # Fallback path when no true per-token timestamps are available.
         if state.first_token_ns is None:
             state.first_token_ns = ts_ns
         elif state.last_emit_ns is not None:
@@ -313,6 +337,23 @@ class OfflineAegaeon:
             if isinstance(tokens, list):
                 return len(tokens)
         return 0
+
+    @staticmethod
+    def _extract_token_timestamps_s(output: dict | object) -> list[float]:
+        if not isinstance(output, dict):
+            return []
+        raw = output.get("_token_timestamps_s")
+        if not isinstance(raw, list) or not raw:
+            return []
+        out: list[float] = []
+        for x in raw:
+            try:
+                out.append(float(x))
+            except (TypeError, ValueError):
+                continue
+        if len(out) < 1:
+            return []
+        return out
 
     def clear_completed(self) -> None:
         self._completed.clear()

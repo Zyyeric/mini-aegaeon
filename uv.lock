@@ -702,6 +702,7 @@ dependencies = [
     { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "safetensors" },
     { name = "torch" },
+    { name = "tqdm" },
 ]
 
 [package.metadata]
@@ -711,6 +712,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.2.6" },
     { name = "safetensors", specifier = ">=0.4.5" },
     { name = "torch", specifier = "==2.9.0", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "tqdm", specifier = ">=4.66.0" },
 ]
 
 [[package]]

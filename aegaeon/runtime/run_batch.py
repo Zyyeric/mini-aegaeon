@@ -9,29 +9,17 @@ class BatchRunner:
     """Adapter boundary for running batched inference."""
 
     def __init__(self, engine: Any | None = None) -> None:
+        if engine is None:
+            raise ValueError("BatchRunner requires a non-None inference engine.")
         self._engine = engine
 
-    def run(self, batch: Batch) -> BatchResult:
+    def run(self, batch: Batch) -> BatchResult | None:
         requests = batch.requests
         phase_name = batch.phase
 
         if not requests:
             return BatchResult(outputs={})
-
-        if self._engine is None:
-            if phase_name in {"decode", "colocate"}:
-                outputs: dict[str, Any] = {}
-                for req in requests:
-                    tok = self._offline_next_token(req)
-                    outputs[req.request_id] = {"phase": phase_name, "tokens": [tok]}
-                return BatchResult(outputs=outputs)
-            return BatchResult(
-                outputs={
-                    req.request_id: {"phase": phase_name, "tokens": [int(t) for t in req.input_ids]}
-                    for req in requests
-                }
-            )
-
+            
         prompts = [req.input_ids for req in requests]
         sampling_params = (
             requests[0].sampling_params

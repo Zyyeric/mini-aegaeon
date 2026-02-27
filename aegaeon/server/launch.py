@@ -23,6 +23,8 @@ def build_local_instances(
     backend_memory_ratio: float = 0.5,
     backend_max_live_workers: int | None = None,
     backend_model_switching: bool = False,
+    backend_global_kv_budget_models: list[str] | None = None,
+    backend_global_kv_worker_count: int | None = None,
     backend_use_dummy_weight: bool = False,
 ) -> dict[str, InstanceRuntime]:
     slots = detect_accelerator_slots()
@@ -56,7 +58,7 @@ def build_local_instances(
 
         mini_sgl_backend_cls = MiniSGLMultiBackend
         # Keep cached weights in the same dtype used by mini-sgl workers.
-        shared_weight_loader = HFWeightLoader(dtype=torch.float16)
+        shared_weight_loader = HFWeightLoader(dtype=torch.bfloat16)
 
     if deployment_mode == "disaggregated":
         launch_plan: list[tuple[str, int]] = [
@@ -73,7 +75,11 @@ def build_local_instances(
             if mini_sgl_backend_cls is None:
                 raise RuntimeError("mini_sgl backend class is not initialized")
             # One backend per runtime instance, all sharing one model cache.
-            instance_weight_manager = ModelCacheManager(cache=shared_model_cache, device="cuda")
+            instance_weight_manager = ModelCacheManager(
+                cache=shared_model_cache,
+                device="cpu",
+                dtype=torch.bfloat16,
+            )
             backend_engine = mini_sgl_backend_cls(
                 weight_manager=instance_weight_manager,
                 memory_ratio=backend_memory_ratio,
@@ -82,6 +88,8 @@ def build_local_instances(
                 model_switching_budget_model_path=(
                     backend_model if backend_model_switching else None
                 ),
+                global_kv_budget_models=backend_global_kv_budget_models,
+                global_kv_worker_count=backend_global_kv_worker_count,
                 use_dummy_weight=backend_use_dummy_weight,
             )
         rt = InstanceRuntime(

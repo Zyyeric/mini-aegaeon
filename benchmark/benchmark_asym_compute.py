@@ -112,7 +112,7 @@ def _run_one_model(
     t_init_start = time.perf_counter()
     llm = LLM(
         model,
-        dtype=torch.float16,
+        dtype=torch.bfloat16,
         offload_linear_weight_to_cpu=True,
         memory_ratio=memory_ratio,
         cuda_graph_max_bs=0,

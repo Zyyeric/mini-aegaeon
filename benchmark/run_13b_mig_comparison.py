@@ -72,7 +72,7 @@ def _merge_minisglang_reports(
         total_e2e += float(data.get("total_e2e_s", 0.0))
 
     merged = {
-        "service": "mini-sglang-offload-mig-partitioned",
+        "service": "asymCompute-mig-partitioned",
         "offload_linear_weight_to_cpu": True,
         "models": sorted(per_model.keys()),
         "prompt_length": prompt_length,
@@ -93,7 +93,7 @@ def _merge_minisglang_reports(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run MIG-partitioned mini-sglang offload vs single-instance mini-aegaeon comparison"
+        description="Run MIG-partitioned asymCompute vs single-instance mini-aegaeon comparison"
     )
     parser.add_argument("--models", default=DEFAULT_MODELS)
     parser.add_argument(
@@ -156,7 +156,7 @@ def main() -> None:
     minisgl_dir = results_dir / "minisglang_per_model"
     minisgl_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) mini-sglang offload on MIG partitions (concurrent in waves)
+    # 1) asymCompute on MIG partitions (concurrent in waves)
     minisgl_reports: list[Path] = []
     wave_count = int(math.ceil(len(model_refs) / len(migs)))
     for wave in range(wave_count):

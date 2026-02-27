@@ -12,15 +12,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-THIS_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = THIS_DIR.parent
-MINISGL_PYTHON = PROJECT_ROOT / "third-party" / "mini-sglang" / "python"
-if str(MINISGL_PYTHON) not in sys.path:
-    sys.path.insert(0, str(MINISGL_PYTHON))
-
-from minisgl.core import SamplingParams  # noqa: E402
-from minisgl.llm import LLM  # noqa: E402
-from transformers import AutoTokenizer  # noqa: E402
+from minisgl.core import SamplingParams
+from minisgl.llm import LLM 
+from transformers import AutoTokenizer
 
 
 @dataclass
@@ -194,7 +188,7 @@ def _run_one_model(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="mini-sglang offload benchmark (TTFT/TBT per model, comparable to mini-aegaeon report)"
+        description="asymCompute benchmark (TTFT/TBT per model, comparable to mini-aegaeon report)"
     )
     parser.add_argument(
         "--models",
@@ -264,7 +258,7 @@ def main() -> None:
     all_tbt = [x for m in per_model.values() for x in m["tbt_ms_samples"]]
 
     report = {
-        "service": "mini-sglang-offload",
+        "service": "asymCompute",
         "offload_linear_weight_to_cpu": True,
         "models": models,
         "prompt_length": args.prompt_length,
